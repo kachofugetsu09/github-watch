@@ -33,7 +33,11 @@
 └──────────┬───────────┘
            ▼
 ┌──────────────────────┐
-│ Verified App comment │  operation marker + API readback
+│ Fire-and-forget turn │  return after turn/start admission
+└──────────┬───────────┘
+           ▼
+┌──────────────────────┐
+│ Agent-owned comment  │  operation marker + preflight dedupe
 └──────────────────────┘
 ```
 
@@ -53,14 +57,14 @@ post-memory，避免 GitHub 任务进入长期记忆。
 comment 不改变 `comment_id`，因此不会重复事件。
 
 ```text
-discovered → claimed → context_ready → turn_running
-                                      ↓
-                              comment_posting → completed
+discovered → claimed → context_ready → turn_submitting → dispatched
 ```
 
-- `claimed/context_ready` 在重启后可安全回到 `discovered`，因为外部效果还未开始。
-- `turn_running/comment_posting` 中断后转为 `manual_reconcile`，不自动重试。
-- comment 内含稳定 operation marker；POST 返回后重新 GET comments，ID 和正文均一致才进入 `completed`。
+- `claimed/context_ready` 在重启后可安全回到 `discovered`，因为 turn 尚未提交。
+- `turn_submitting` 中断后转为 `manual_reconcile`，不自动重试。
+- `turn/start` 返回 turn id 后立即进入终态 `dispatched`；插件不等待 `turn/completed`。
+- Agent 自行发送 comment，发送前检查稳定 operation marker，已有则不重复发送。
+- 带 operation marker 的 comment 永不触发 owner mention，避免 owner 凭证发送时形成自激循环。
 
 ## 上下文和凭证
 

@@ -66,7 +66,9 @@ class EventLedger:
                 """
                 UPDATE events SET status = 'manual_reconcile', updated_at = ?,
                                   error = 'runtime interrupted after external effect began'
-                WHERE status IN ('turn_running', 'comment_posting')
+                WHERE status IN (
+                    'turn_running', 'turn_submitting', 'comment_posting'
+                )
                 """,
                 (utc_now(),),
             ).rowcount

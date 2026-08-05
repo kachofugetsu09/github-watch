@@ -43,7 +43,6 @@ def build_watch(tmp_path: Path, fake: FakeGitHub) -> tuple[GitHubWatch, EventLed
         control_endpoint="unused.sock",
         mention="@akashic-review-bot",
         bot_login="akashic-review-bot[bot]",
-        turn_timeout_seconds=30,
     )
     return watch, ledger
 
@@ -115,4 +114,23 @@ def test_code_and_longer_login_do_not_count_as_mentions(tmp_path):
     ]
     fake.issue_rows = [item(8, "t2")]
     watch._discover_repository("owner/repo")
+    assert ledger.pending_events() == []
+
+
+def test_agent_operation_comment_never_reawakens_owner_thread(tmp_path):
+    fake = FakeGitHub()
+    fake.issue_rows = [item(9, "t1")]
+    watch, ledger = build_watch(tmp_path, fake)
+    watch._discover_repository("owner/repo")
+
+    fake.comment_rows[9] = [
+        comment(
+            1,
+            "owner",
+            "<!-- akashic-operation:abc -->\n@akashic-review-bot analysis complete",
+        )
+    ]
+    fake.issue_rows = [item(9, "t2")]
+    watch._discover_repository("owner/repo")
+
     assert ledger.pending_events() == []

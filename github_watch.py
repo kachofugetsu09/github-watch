@@ -18,7 +18,7 @@ logger = logging.getLogger("plugin.github-watch")
 
 
 class GitHubWatch:
-    """Discover allowed events, wake stable threads, and publish verified comments."""
+    """Discover allowed events and submit each wake to one stable thread."""
 
     def __init__(
         self,
@@ -29,7 +29,6 @@ class GitHubWatch:
         control_endpoint: str,
         mention: str,
         bot_login: str,
-        turn_timeout_seconds: int,
     ) -> None:
         self._client = client
         self._ledger = ledger
@@ -40,7 +39,6 @@ class GitHubWatch:
             rf"(?<![A-Za-z0-9-]){escaped_mention}(?![A-Za-z0-9-])"
         )
         self._bot_login = bot_login.casefold()
-        self._turn_timeout_seconds = turn_timeout_seconds
 
     async def poll(self, repositories: list[str]) -> None:
         """Poll repositories serially, then drain each newly discovered event once."""
@@ -109,6 +107,7 @@ class GitHubWatch:
                     login.casefold() == owner.casefold()
                     and login.casefold() != self._bot_login
                     and isinstance(body, str)
+                    and not self._has_operation_marker(body)
                     and self._contains_mention(body)
                 ):
                     self._ledger.create_event(
@@ -155,85 +154,41 @@ class GitHubWatch:
         )
 
         try:
-            response = await self._run_turn(event, manifest)
-        except asyncio.TimeoutError:
-            self._ledger.transition(
-                event.event_key,
-                expected=("turn_running",),
-                status="failed_timeout",
-                error=f"turn exceeded {self._turn_timeout_seconds}s and was interrupted",
-            )
-            return
+            await self._dispatch_turn(event, manifest)
         except Exception as exc:
             current = self._ledger.get_event(event.event_key)
+            if current.status == "context_ready":
+                self._ledger.transition(
+                    event.event_key,
+                    expected=("context_ready",),
+                    status="discovered",
+                    error=repr(exc),
+                )
+                logger.exception(
+                    "github-watch dispatch failed safely; retry next poll event=%s",
+                    event.event_key,
+                )
+                return
             self._ledger.transition(
                 event.event_key,
                 expected=(current.status,),
-                status="failed_turn",
+                status="dispatch_unconfirmed",
                 error=repr(exc),
             )
-            logger.exception("github-watch turn failed event=%s", event.event_key)
-            return
-        if not response.strip():
-            self._ledger.transition(
+            logger.exception(
+                "github-watch dispatch is uncertain; refusing retry event=%s",
                 event.event_key,
-                expected=("turn_running",),
-                status="failed_empty_response",
-                error="agent returned an empty final response",
             )
             return
-        response = response.strip()[:60_000]
-        self._ledger.transition(
-            event.event_key,
-            expected=("turn_running",),
-            status="comment_posting",
-            response=response,
-        )
-
-        # Once POST begins, any failure is uncertain and must never auto-repeat.
-        comment_body = f"<!-- akashic-operation:{event.operation_id} -->\n{response}"
-        try:
-            comment = await asyncio.to_thread(
-                self._client.post_comment,
-                event.repo,
-                event.number,
-                comment_body,
-            )
-            comment_id = self._comment_id(comment)
-            comments = await asyncio.to_thread(
-                self._client.comments, event.repo, event.number
-            )
-            confirmed = any(
-                self._comment_id(row) == comment_id and row.get("body") == comment_body
-                for row in comments
-            )
-            if not confirmed:
-                raise RuntimeError(f"comment {comment_id} readback mismatch")
-        except Exception as exc:
-            self._ledger.transition(
-                event.event_key,
-                expected=("comment_posting",),
-                status="comment_unconfirmed",
-                error=repr(exc),
-            )
-            logger.exception("github-watch comment uncertain event=%s", event.event_key)
-            return
-        self._ledger.transition(
-            event.event_key,
-            expected=("comment_posting",),
-            status="completed",
-            artifact_id=str(comment_id),
-        )
         logger.info(
-            "github-watch completed event=%s thread=%s turn=%s comment=%s",
+            "github-watch dispatched event=%s thread=%s turn=%s",
             event.event_key,
             self._ledger.get_event(event.event_key).thread_id,
             self._ledger.get_event(event.event_key).turn_id,
-            comment_id,
         )
 
-    async def _run_turn(self, event: EventState, manifest: Path) -> str:
-        """Reuse one item thread and interrupt timed-out remote work explicitly."""
+    async def _dispatch_turn(self, event: EventState, manifest: Path) -> None:
+        """Submit one durable turn and return immediately after admission."""
 
         async with await ControlClient.connect(self._control_endpoint) as client:
             item = self._ledger.get_item(event.repo, event.kind, event.number)
@@ -258,7 +213,7 @@ class GitHubWatch:
             self._ledger.transition(
                 event.event_key,
                 expected=("context_ready",),
-                status="turn_running",
+                status="turn_submitting",
                 thread_id=thread_id,
             )
             handle = await client.start_turn(
@@ -266,39 +221,32 @@ class GitHubWatch:
             )
             self._ledger.transition(
                 event.event_key,
-                expected=("turn_running",),
-                status="turn_running",
+                expected=("turn_submitting",),
+                status="dispatched",
                 turn_id=handle.id,
             )
-            try:
-                turn = await asyncio.wait_for(
-                    handle.result(), timeout=self._turn_timeout_seconds
-                )
-            except asyncio.TimeoutError:
-                await handle.interrupt()
-                raise
-        response = turn.get("finalResponse")
-        if not isinstance(response, str):
-            raise TypeError(f"turn/completed missing finalResponse: {turn}")
-        return response
 
     @staticmethod
     def _build_prompt(event: EventState, manifest: Path) -> str:
         permission = (
             "这是仓库 owner 的新 @mention。只有这条 mention 明确要求修改代码或创建 PR 时，"
-            "你才可以使用本地 shell 修改代码或创建 PR；否则严禁改动仓库或 GitHub 状态。"
+            "你才可以使用本地 shell 修改代码或创建 PR；否则只能分析并发布 comment。"
             if event.trigger_kind == "owner_mention"
-            else "这是对新对象的首次处理。只做分析，严禁修改代码、push、创建 PR 或直接评论。"
+            else "这是对新对象的首次处理。只做分析，严禁修改代码、push 或创建 PR。"
         )
-        return f"""[github-watch]
+        return f"""[github-watch fire-and-forget]
 仓库: {event.repo}
 对象: {event.kind} #{event.number}
 触发: {event.trigger_kind} {event.trigger_id}
+操作标识: {event.operation_id}
 证据清单: {manifest}
 
 你处在这个 Issue/PR 的稳定专用 thread 中，上一次评论和完整历史都在该 thread 与本次证据包中。
 先读 manifest 和其列出的全部文件，以新鲜 GitHub 证据为准。{permission}
-不要自己调用 GitHub 评论 API；最终回复只输出要由插件发布的中文 comment 正文，不要加代码块或机器可读包装。"""
+插件不会等待或代发你的最终回复。你必须在完成处理后自行使用当前可用的 GitHub CLI/API，
+向这个 Issue/PR 发布且只发布一条中文 comment；comment 首行必须是
+`<!-- akashic-operation:{event.operation_id} -->`。发送前先检查现有 comment 是否已有该标识，
+已有则不得重复发送。若 GitHub 凭证或发送失败，直接让本轮失败并保留明确错误，不要伪装成功。"""
 
     @staticmethod
     def _item_identity(item: dict[str, Any]) -> tuple[int, str]:
@@ -329,3 +277,7 @@ class GitHubWatch:
         without_fences = re.sub(r"```.*?```", "", body, flags=re.DOTALL)
         without_code = re.sub(r"`[^`]*`", "", without_fences)
         return self._mention_pattern.search(without_code.casefold()) is not None
+
+    @staticmethod
+    def _has_operation_marker(body: str) -> bool:
+        return "<!-- akashic-operation:" in body.casefold()

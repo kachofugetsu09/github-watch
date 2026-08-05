@@ -52,7 +52,7 @@ def test_started_external_effect_is_never_automatically_retried(tmp_path):
     ledger.transition(event.event_key, expected=("discovered",), status="claimed")
     ledger.transition(event.event_key, expected=("claimed",), status="context_ready")
     ledger.transition(
-        event.event_key, expected=("context_ready",), status="turn_running"
+        event.event_key, expected=("context_ready",), status="turn_submitting"
     )
 
     assert ledger.recover_interrupted() == {
