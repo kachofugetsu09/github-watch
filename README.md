@@ -15,6 +15,9 @@ Akashic API v2 轮询插件，不使用 webhook。
   clone 精确仓库状态；after-turn 删除目录，异常退出由 TTL sweeper 回收。
 - Agent 默认只分析，并通过 `github_watch_*` 工具以 GitHub App Bot 身份发布 comment/review。
   只有 owner mention 明确要求修改或创建 PR 时，才允许在临时仓库提交、push 和创建 PR。
+- 从 Issue 创建的修复 PR 必须使用 `Fixes #<issue>` 关联并在合入后自动关闭 Issue；每个 Issue
+  修复链默认只创建一个 PR。PR 上的后续修改默认不得递归另开替代 PR，工具无法更新当前 PR
+  时必须在原 PR 说明阻塞；只有 owner 明确要求时才能另开并声明 supersedes 关系。
 - 配置主 channel 后，Agent 只在需要维护者决策、出现关键阻塞/风险，或非常值得立即告知时
   选择性调用一次 `message_push`；普通成功、常规 review 和过程进度不推送。
 

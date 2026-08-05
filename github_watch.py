@@ -267,6 +267,17 @@ class GitHubWatch:
             if event.kind == "pr"
             else "完成分析后必须调用 github_watch_post_comment 发布一条 comment。"
         )
+        pull_request_contract = (
+            f"如果本轮为当前 Issue 创建修复 PR，PR 正文必须包含独立一行 `Fixes #{event.number}`，"
+            "让 PR 合入默认分支时自动关闭当前 Issue。每个 Issue 修复链只创建一个 PR；"
+            "后续修改应继续使用该 PR，禁止递归创建替代 PR。"
+            if event.kind == "issue"
+            else "当前对象已经是 PR。owner 要求修改、补测试或继续处理时，默认只在当前 PR 上"
+            "review/comment，禁止把 github_watch_create_pr 当作无法更新当前 PR 的 fallback。"
+            "若现有工具无法把提交推回当前 PR head，必须在当前 PR 评论说明阻塞并请求 owner 决策。"
+            "只有 owner 明确要求另开替代 PR 时才可创建；替代 PR 必须保留关联 Issue 的 closing "
+            "keyword，并在正文说明它 supersedes 当前 PR。"
+        )
         notification = self._notification_prompt()
         return f"""[github-watch fire-and-forget]
 仓库: {event.repo}
@@ -280,6 +291,7 @@ class GitHubWatch:
 先读 manifest 和全部证据，再只在临时仓库中读取、测试或修改，以新鲜 GitHub 证据为准。{permission}
 禁止使用系统 gh、个人 GitHub 凭证或直接 git push；所有 GitHub 写操作必须使用 github_watch_* 工具，
 这些工具会绑定当前 operation、仓库和 Bot installation identity。{delivery}
+{pull_request_contract}
 {notification}
 工具会自动添加并检查 operation marker，不要自行写 marker。若明确获准修改并创建 PR，先在临时仓库
 完成并提交改动，再调用 github_watch_push_branch，最后调用 github_watch_create_pr。

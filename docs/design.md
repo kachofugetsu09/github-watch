@@ -9,6 +9,9 @@
 - commit、label、state、普通 comment 和 comment edit 不唤醒。
 - 只有 repository owner 新发的 `@akashic-review-bot` comment 可以再唤醒。
 - owner mention 默认仍只 comment；它明确要求修改或创建 PR 时，程序化 Agent 才可使用本地 Shell 执行。
+- Issue 触发的修复 PR 正文必须写 `Fixes #<issue>`，使默认分支合入自动关闭对应 Issue；同一
+  Issue 修复链默认只创建一个 PR。PR 上的修改请求不得把另开 PR 当作 fallback；无法更新当前
+  PR 时在原 PR 暴露阻塞，只有 owner 明确要求替代 PR 时才创建并声明 closing/supersedes 关系。
 
 ## 所有权和流程
 
