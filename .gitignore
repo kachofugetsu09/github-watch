@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+*.pem
+*.key
+config.toml
+clone/
+events.sqlite3*
+evidence/
+repos/
+state.json
+watch.log
+.pytest_cache/
+.venv/

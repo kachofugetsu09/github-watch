@@ -1,0 +1,9 @@
+app_id = 123456
+installation_id = 12345678
+pem_path = "/absolute/path/to/github-app.private-key.pem"
+repositories = ["owner/repository"]
+mention = "@akashic-review-bot"
+bot_login = "akashic-review-bot[bot]"
+poll_seconds = 60
+turn_timeout_seconds = 900
+# control_endpoint = "/absolute/path/to/workspace/akashic.sock"
