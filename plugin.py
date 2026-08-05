@@ -17,7 +17,7 @@ from agent.plugins import (
     tool,
 )
 from agent.tools.base import get_current_tool_context
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from .checkout import CheckoutManager
 from .github_client import GitHubClient
@@ -39,6 +39,8 @@ class GitHubWatchConfig(BaseModel):
     poll_seconds: int = Field(default=60, ge=15)
     checkout_ttl_seconds: int = Field(default=86_400, ge=300)
     control_endpoint: str | None = None
+    notify_channel: str | None = None
+    notify_chat_id: str | None = None
 
     @field_validator("repositories")
     @classmethod
@@ -57,11 +59,20 @@ class GitHubWatchConfig(BaseModel):
             raise ValueError("mention must be one @handle")
         return value
 
+    @model_validator(mode="after")
+    def validate_notification_target(self) -> "GitHubWatchConfig":
+        values = (self.notify_channel, self.notify_chat_id)
+        if (values[0] is None) != (values[1] is None):
+            raise ValueError("notify_channel and notify_chat_id must be configured together")
+        if any(value is not None and not value.strip() for value in values):
+            raise ValueError("notification target values must not be blank")
+        return self
+
 
 class GitHubWatchPlugin(Plugin):
     api_version = 2
     name = "github-watch"
-    version = "1.2.0"
+    version = "1.2.1"
     desc = "Poll GitHub and wake one stable Akashic thread per issue or PR"
     ConfigModel = GitHubWatchConfig
 
@@ -106,6 +117,8 @@ class GitHubWatchPlugin(Plugin):
             control_endpoint=endpoint,
             mention=config.mention,
             bot_login=config.bot_login,
+            notify_channel=config.notify_channel,
+            notify_chat_id=config.notify_chat_id,
         )
 
     def jobs(self) -> list[PluginJobSpec]:

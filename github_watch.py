@@ -32,6 +32,8 @@ class GitHubWatch:
         control_endpoint: str,
         mention: str,
         bot_login: str,
+        notify_channel: str | None = None,
+        notify_chat_id: str | None = None,
     ) -> None:
         self._client = client
         self._ledger = ledger
@@ -43,6 +45,8 @@ class GitHubWatch:
             rf"(?<![A-Za-z0-9-]){escaped_mention}(?![A-Za-z0-9-])"
         )
         self._bot_login = bot_login.casefold()
+        self._notify_channel = notify_channel
+        self._notify_chat_id = notify_chat_id
 
     async def poll(self, repositories: list[str]) -> None:
         """Poll repositories serially, then drain each newly discovered event once."""
@@ -246,8 +250,12 @@ class GitHubWatch:
                 turn_id=handle.id,
             )
 
-    @staticmethod
-    def _build_prompt(event: EventState, manifest: Path, checkout_path: Path) -> str:
+    def _build_prompt(
+        self,
+        event: EventState,
+        manifest: Path,
+        checkout_path: Path,
+    ) -> str:
         permission = (
             "这是仓库 owner 的新 @mention。只有这条 mention 明确要求修改代码或创建 PR 时，"
             "你才可以使用本地 shell 修改代码或创建 PR；否则只能分析并发布 comment。"
@@ -259,6 +267,7 @@ class GitHubWatch:
             if event.kind == "pr"
             else "完成分析后必须调用 github_watch_post_comment 发布一条 comment。"
         )
+        notification = self._notification_prompt()
         return f"""[github-watch fire-and-forget]
 仓库: {event.repo}
 对象: {event.kind} #{event.number}
@@ -271,10 +280,24 @@ class GitHubWatch:
 先读 manifest 和全部证据，再只在临时仓库中读取、测试或修改，以新鲜 GitHub 证据为准。{permission}
 禁止使用系统 gh、个人 GitHub 凭证或直接 git push；所有 GitHub 写操作必须使用 github_watch_* 工具，
 这些工具会绑定当前 operation、仓库和 Bot installation identity。{delivery}
+{notification}
 工具会自动添加并检查 operation marker，不要自行写 marker。若明确获准修改并创建 PR，先在临时仓库
 完成并提交改动，再调用 github_watch_push_branch，最后调用 github_watch_create_pr。
 插件不会等待或代发最终回复；GitHub 写操作失败时让本轮明确失败，不要伪装成功。临时仓库由宿主在
 本轮 after-turn 后删除，崩溃遗留由下一轮 TTL sweeper 回收。"""
+
+    def _notification_prompt(self) -> str:
+        """生成当前 turn 的窄范围选择性通知合同。"""
+
+        if self._notify_channel is None or self._notify_chat_id is None:
+            return "主 channel 通知未配置，禁止调用 message_push。"
+        return f"""你可以选择是否用 message_push 通知维护者的主 channel，但门槛必须很高：
+- 需要维护者作出选择、批准或补充关键信息，导致当前工作无法安全继续；或者
+- 出现阻塞、高风险、关键失败，或你非常确信这是维护者会希望立刻知道的重要结果。
+普通成功、常规 review、过程进度、重复结论和无须行动的信息禁止推送。每个 operation 最多调用一次
+message_push；消息必须简短，写明仓库与 Issue/PR、为何值得打扰，以及需要维护者做什么（如有）。
+固定参数：target_channel={self._notify_channel!r}，target_chat_id={self._notify_chat_id!r}。
+message_push 是 fire-and-forget；调用后继续完成 GitHub comment/review，不等待主 channel 回复。"""
 
     @staticmethod
     def _item_identity(item: dict[str, Any]) -> tuple[int, str]:

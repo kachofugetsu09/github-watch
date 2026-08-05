@@ -75,6 +75,8 @@ def test_dispatch_returns_after_turn_admission_without_waiting_for_result(
         control_endpoint="control.sock",
         mention="@akashic-review-bot",
         bot_login="akashic-review-bot[bot]",
+        notify_channel="mobile",
+        notify_chat_id="main-chat",
     )
 
     checkout = tmp_path / "checkout"
@@ -90,3 +92,22 @@ def test_dispatch_returns_after_turn_admission_without_waiting_for_result(
     assert str(checkout) in control.prompt
     assert "github_watch_post_comment" in control.prompt
     assert "禁止使用系统 gh" in control.prompt
+    assert "门槛必须很高" in control.prompt
+    assert "每个 operation 最多调用一次" in control.prompt
+    assert "target_channel='mobile'" in control.prompt
+    assert "target_chat_id='main-chat'" in control.prompt
+
+
+def test_prompt_forbids_message_push_without_notification_target(tmp_path: Path) -> None:
+    ledger = EventLedger(tmp_path / "events.sqlite3")
+    watch = GitHubWatch(
+        client=FakeGitHub(),  # type: ignore[arg-type]
+        ledger=ledger,
+        checkouts=object(),  # type: ignore[arg-type]
+        data_dir=tmp_path,
+        control_endpoint="control.sock",
+        mention="@akashic-review-bot",
+        bot_login="akashic-review-bot[bot]",
+    )
+
+    assert watch._notification_prompt() == "主 channel 通知未配置，禁止调用 message_push。"

@@ -46,6 +46,10 @@ GitHub 保存远程权威事实；`events.sqlite3` 保存消费和恢复事实�
 post-memory，避免 GitHub 任务进入长期记忆。每个 operation 使用唯一 `/tmp` checkout；
 after-turn 按 control turn ID 找回 operation 并删除，进程中断时由轮询 TTL 清扫恢复。
 
+配置通知目标时，prompt 允许 Agent 在需要维护者决策、关键阻塞/风险或极重要结果时，向固定主
+channel 调用一次 `message_push`。通知不取代 GitHub comment/review，不等待主 channel 回复；普通
+成功、常规 review 和过程进度保持静默。未配置通知目标时 prompt 明确禁止 `message_push`。
+
 ## 事件与恢复
 
 稳定事件键：
