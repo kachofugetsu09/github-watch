@@ -5,6 +5,7 @@ Akashic API v2 轮询插件，不使用 webhook。
 ## 行为
 
 - 首次启用只建立基线，不处理已有 Issue/PR。
+- 只轮询 open Issue 和 open PR；关闭或已合并对象不进入 baseline，也不再追踪。
 - 基线后新建的 Issue/PR 只触发一次 programmatic turn；PR 默认提交一次 `COMMENT` review。
 - commit、状态、编辑和普通 comment 不唤醒。
 - 只有仓库 owner 新发的、包含 `@akashic-review-bot` 的 comment 可以再次唤醒。

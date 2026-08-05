@@ -3,6 +3,7 @@
 ## 目标语义
 
 - 不使用 webhook；由 Akashic Plugin API v2 的 interval job 串行轮询。
+- 只列出 open Issue 和 open PR；关闭或已合并对象不进入首次 baseline 和后续轮询。
 - 首次启用只建立 baseline，不回复已有 Issue/PR。
 - baseline 后的新 Issue/PR 只唤醒一次，默认只分析并 comment。
 - commit、label、state、普通 comment 和 comment edit 不唤醒。

@@ -45,6 +45,20 @@ def test_pagination_follows_link_and_reuses_conditional_pages():
     ]
 
 
+def test_issue_and_pull_lists_request_only_open_objects() -> None:
+    issue_client = FakePagedClient()
+    assert issue_client.issues("owner/repo") == [{"id": 1}, {"id": 2}]
+    assert issue_client.calls[0][0].startswith(
+        "/repos/owner/repo/issues?state=open&"
+    )
+
+    pull_client = FakePagedClient()
+    assert pull_client.pulls("owner/repo") == [{"id": 1}, {"id": 2}]
+    assert pull_client.calls[0][0].startswith(
+        "/repos/owner/repo/pulls?state=open&"
+    )
+
+
 class FakeWriteClient(GitHubClient):
     def __init__(self) -> None:
         super().__init__(app_id=1, installation_id=2, pem_path=Path("unused"))

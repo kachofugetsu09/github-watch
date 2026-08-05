@@ -111,13 +111,13 @@ class GitHubClient:
 
     def issues(self, repo: str) -> list[dict[str, Any]]:
         rows = self.paginate(
-            f"/repos/{repo}/issues?state=all&sort=created&direction=desc"
+            f"/repos/{repo}/issues?state=open&sort=created&direction=desc"
         )
         return [row for row in rows if "pull_request" not in row]
 
     def pulls(self, repo: str) -> list[dict[str, Any]]:
         return self.paginate(
-            f"/repos/{repo}/pulls?state=all&sort=created&direction=desc"
+            f"/repos/{repo}/pulls?state=open&sort=created&direction=desc"
         )
 
     def issue(self, repo: str, number: int) -> dict[str, Any]:
