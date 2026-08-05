@@ -189,6 +189,39 @@ class GitHubClient:
             "comment",
         )
 
+    def post_review(self, repo: str, number: int, body: str) -> dict[str, Any]:
+        return self._require_object(
+            self.request(
+                "POST",
+                f"/repos/{repo}/pulls/{number}/reviews",
+                body={"body": body, "event": "COMMENT"},
+            ),
+            "review",
+        )
+
+    def create_pull(
+        self,
+        repo: str,
+        *,
+        title: str,
+        body: str,
+        head: str,
+        base: str,
+    ) -> dict[str, Any]:
+        return self._require_object(
+            self.request(
+                "POST",
+                f"/repos/{repo}/pulls",
+                body={
+                    "title": title,
+                    "body": body,
+                    "head": head,
+                    "base": base,
+                },
+            ),
+            "pull",
+        )
+
     def _conditional_page(self, path: str, accept: str) -> tuple[Any, str | None]:
         cache_key = f"{accept}\n{path}"
         cached = self._page_cache.get(cache_key)

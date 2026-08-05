@@ -43,3 +43,52 @@ def test_pagination_follows_link_and_reuses_conditional_pages():
         ("/resource?per_page=100", {"If-None-Match": '"one"'}),
         ("/resource?per_page=100&page=2", {"If-None-Match": '"two"'}),
     ]
+
+
+class FakeWriteClient(GitHubClient):
+    def __init__(self) -> None:
+        super().__init__(app_id=1, installation_id=2, pem_path=Path("unused"))
+        self.writes: list[tuple[str, str, dict[str, object] | None]] = []
+
+    def request(
+        self,
+        method: str,
+        path: str,
+        *,
+        token: str | None = None,
+        body: dict[str, object] | None = None,
+        accept: str = "application/vnd.github+json",
+    ) -> Any:
+        del token, accept
+        self.writes.append((method, path, body))
+        return {"id": 1}
+
+
+def test_review_and_pull_writes_use_rest_endpoints_and_comment_review_event() -> None:
+    client = FakeWriteClient()
+
+    assert client.post_review("owner/repo", 7, "body") == {"id": 1}
+    assert client.create_pull(
+        "owner/repo",
+        title="title",
+        body="body",
+        head="branch",
+        base="main",
+    ) == {"id": 1}
+    assert client.writes == [
+        (
+            "POST",
+            "/repos/owner/repo/pulls/7/reviews",
+            {"body": "body", "event": "COMMENT"},
+        ),
+        (
+            "POST",
+            "/repos/owner/repo/pulls",
+            {
+                "title": "title",
+                "body": "body",
+                "head": "branch",
+                "base": "main",
+            },
+        ),
+    ]

@@ -223,6 +223,32 @@ class EventLedger:
             raise KeyError(event_key)
         return EventState(*row)
 
+    def get_event_by_operation(self, operation_id: str) -> EventState:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT event_key, operation_id, repo, kind, number,
+                       trigger_kind, trigger_id, status, thread_id, turn_id
+                FROM events WHERE operation_id = ?
+                """,
+                (operation_id,),
+            ).fetchone()
+        if row is None:
+            raise KeyError(operation_id)
+        return EventState(*row)
+
+    def get_event_by_turn(self, turn_id: str) -> EventState | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT event_key, operation_id, repo, kind, number,
+                       trigger_kind, trigger_id, status, thread_id, turn_id
+                FROM events WHERE turn_id = ?
+                """,
+                (turn_id,),
+            ).fetchone()
+        return EventState(*row) if row is not None else None
+
     def pending_events(self) -> list[EventState]:
         with self._connect() as connection:
             rows = connection.execute(

@@ -70,13 +70,15 @@ def test_dispatch_returns_after_turn_admission_without_waiting_for_result(
     watch = GitHubWatch(
         client=FakeGitHub(),  # type: ignore[arg-type]
         ledger=ledger,
+        checkouts=object(),  # type: ignore[arg-type]
         data_dir=tmp_path,
         control_endpoint="control.sock",
         mention="@akashic-review-bot",
         bot_login="akashic-review-bot[bot]",
     )
 
-    asyncio.run(watch._dispatch_turn(event, tmp_path / "manifest.json"))
+    checkout = tmp_path / "checkout"
+    asyncio.run(watch._dispatch_turn(event, tmp_path / "manifest.json", checkout))
 
     dispatched = ledger.get_event(event.event_key)
     assert dispatched.status == "dispatched"
@@ -84,5 +86,7 @@ def test_dispatch_returns_after_turn_admission_without_waiting_for_result(
     assert dispatched.turn_id == "turn-1"
     assert control.closed
     assert control.prompt is not None
-    assert "插件不会等待或代发你的最终回复" in control.prompt
-    assert f"<!-- akashic-operation:{event.operation_id} -->" in control.prompt
+    assert "插件不会等待或代发最终回复" in control.prompt
+    assert str(checkout) in control.prompt
+    assert "github_watch_post_comment" in control.prompt
+    assert "禁止使用系统 gh" in control.prompt

@@ -5,4 +5,5 @@ repositories = ["owner/repository"]
 mention = "@akashic-review-bot"
 bot_login = "akashic-review-bot[bot]"
 poll_seconds = 60
+checkout_ttl_seconds = 86400
 # control_endpoint = "/absolute/path/to/workspace/akashic.sock"

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 from pathlib import Path
@@ -11,6 +12,7 @@ from typing import Any
 from agent.control.client import ControlClient
 
 from .context_bundle import ContextBundle
+from .checkout import CheckoutManager
 from .github_client import GitHubClient
 from .ledger import EventLedger, EventState
 
@@ -25,6 +27,7 @@ class GitHubWatch:
         *,
         client: GitHubClient,
         ledger: EventLedger,
+        checkouts: CheckoutManager,
         data_dir: Path,
         control_endpoint: str,
         mention: str,
@@ -32,6 +35,7 @@ class GitHubWatch:
     ) -> None:
         self._client = client
         self._ledger = ledger
+        self._checkouts = checkouts
         self._context = ContextBundle(client, data_dir)
         self._control_endpoint = control_endpoint
         escaped_mention = re.escape(mention.casefold())
@@ -43,11 +47,16 @@ class GitHubWatch:
     async def poll(self, repositories: list[str]) -> None:
         """Poll repositories serially, then drain each newly discovered event once."""
 
-        # 1. Discover events and advance observation cursors
+        # 1. Recover checkout storage before reading new remote state.
+        removed = await asyncio.to_thread(self._checkouts.sweep)
+        if removed:
+            logger.warning("github-watch swept expired checkouts count=%d", removed)
+
+        # 2. Discover events and advance observation cursors
         for repo in repositories:
             await asyncio.to_thread(self._discover_repository, repo)
 
-        # 2. Run only durable events that have never begun an external effect
+        # 3. Run only durable events that have never begun an external effect
         for event in self._ledger.pending_events():
             await self._process_event(event)
 
@@ -134,7 +143,12 @@ class GitHubWatch:
         )
         try:
             manifest = await asyncio.to_thread(self._context.build, event)
+            item = json.loads((manifest.parent / "item.json").read_text(encoding="utf-8"))
+            if not isinstance(item, dict):
+                raise TypeError("github-watch item evidence is not an object")
+            checkout = await asyncio.to_thread(self._checkouts.prepare, event, item)
         except Exception as exc:
+            await asyncio.to_thread(self._checkouts.cleanup, event.operation_id)
             self._ledger.transition(
                 event.event_key,
                 expected=("claimed",),
@@ -154,10 +168,11 @@ class GitHubWatch:
         )
 
         try:
-            await self._dispatch_turn(event, manifest)
+            await self._dispatch_turn(event, manifest, checkout.path)
         except Exception as exc:
             current = self._ledger.get_event(event.event_key)
             if current.status == "context_ready":
+                await asyncio.to_thread(self._checkouts.cleanup, event.operation_id)
                 self._ledger.transition(
                     event.event_key,
                     expected=("context_ready",),
@@ -187,7 +202,12 @@ class GitHubWatch:
             self._ledger.get_event(event.event_key).turn_id,
         )
 
-    async def _dispatch_turn(self, event: EventState, manifest: Path) -> None:
+    async def _dispatch_turn(
+        self,
+        event: EventState,
+        manifest: Path,
+        checkout_path: Path,
+    ) -> None:
         """Submit one durable turn and return immediately after admission."""
 
         async with await ControlClient.connect(self._control_endpoint) as client:
@@ -217,7 +237,7 @@ class GitHubWatch:
                 thread_id=thread_id,
             )
             handle = await client.start_turn(
-                thread_id, self._build_prompt(event, manifest)
+                thread_id, self._build_prompt(event, manifest, checkout_path)
             )
             self._ledger.transition(
                 event.event_key,
@@ -227,12 +247,17 @@ class GitHubWatch:
             )
 
     @staticmethod
-    def _build_prompt(event: EventState, manifest: Path) -> str:
+    def _build_prompt(event: EventState, manifest: Path, checkout_path: Path) -> str:
         permission = (
             "这是仓库 owner 的新 @mention。只有这条 mention 明确要求修改代码或创建 PR 时，"
             "你才可以使用本地 shell 修改代码或创建 PR；否则只能分析并发布 comment。"
             if event.trigger_kind == "owner_mention"
             else "这是对新对象的首次处理。只做分析，严禁修改代码、push 或创建 PR。"
+        )
+        delivery = (
+            "完成分析后必须调用 github_watch_submit_review 发布一条 COMMENT review。"
+            if event.kind == "pr"
+            else "完成分析后必须调用 github_watch_post_comment 发布一条 comment。"
         )
         return f"""[github-watch fire-and-forget]
 仓库: {event.repo}
@@ -240,13 +265,16 @@ class GitHubWatch:
 触发: {event.trigger_kind} {event.trigger_id}
 操作标识: {event.operation_id}
 证据清单: {manifest}
+临时仓库: {checkout_path}
 
 你处在这个 Issue/PR 的稳定专用 thread 中，上一次评论和完整历史都在该 thread 与本次证据包中。
-先读 manifest 和其列出的全部文件，以新鲜 GitHub 证据为准。{permission}
-插件不会等待或代发你的最终回复。你必须在完成处理后自行使用当前可用的 GitHub CLI/API，
-向这个 Issue/PR 发布且只发布一条中文 comment；comment 首行必须是
-`<!-- akashic-operation:{event.operation_id} -->`。发送前先检查现有 comment 是否已有该标识，
-已有则不得重复发送。若 GitHub 凭证或发送失败，直接让本轮失败并保留明确错误，不要伪装成功。"""
+先读 manifest 和全部证据，再只在临时仓库中读取、测试或修改，以新鲜 GitHub 证据为准。{permission}
+禁止使用系统 gh、个人 GitHub 凭证或直接 git push；所有 GitHub 写操作必须使用 github_watch_* 工具，
+这些工具会绑定当前 operation、仓库和 Bot installation identity。{delivery}
+工具会自动添加并检查 operation marker，不要自行写 marker。若明确获准修改并创建 PR，先在临时仓库
+完成并提交改动，再调用 github_watch_push_branch，最后调用 github_watch_create_pr。
+插件不会等待或代发最终回复；GitHub 写操作失败时让本轮明确失败，不要伪装成功。临时仓库由宿主在
+本轮 after-turn 后删除，崩溃遗留由下一轮 TTL sweeper 回收。"""
 
     @staticmethod
     def _item_identity(item: dict[str, Any]) -> tuple[int, str]:

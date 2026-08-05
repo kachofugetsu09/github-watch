@@ -39,6 +39,7 @@ def build_watch(tmp_path: Path, fake: FakeGitHub) -> tuple[GitHubWatch, EventLed
     watch = GitHubWatch(
         client=fake,  # type: ignore[arg-type]
         ledger=ledger,
+        checkouts=object(),  # type: ignore[arg-type]
         data_dir=tmp_path,
         control_endpoint="unused.sock",
         mention="@akashic-review-bot",

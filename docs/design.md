@@ -25,7 +25,7 @@
 └──────────┬───────────┘
            ▼
 ┌──────────────────────┐
-│ Evidence bundle      │  full pages + PR diff + SHA-256 manifest
+│ Evidence + checkout  │  full pages + PR diff + /tmp exact head
 └──────────┬───────────┘
            ▼
 ┌──────────────────────┐
@@ -37,13 +37,14 @@
 └──────────┬───────────┘
            ▼
 ┌──────────────────────┐
-│ Agent-owned comment  │  operation marker + preflight dedupe
+│ App-owned effect     │  Bot comment/review/branch/PR + dedupe
 └──────────────────────┘
 ```
 
 GitHub 保存远程权威事实；`events.sqlite3` 保存消费和恢复事实；Akashic
 `sessions.db` 只追加稳定 thread 与 turn 消息。thread metadata 关闭 memory retrieval 和
-post-memory，避免 GitHub 任务进入长期记忆。
+post-memory，避免 GitHub 任务进入长期记忆。每个 operation 使用唯一 `/tmp` checkout；
+after-turn 按 control turn ID 找回 operation 并删除，进程中断时由轮询 TTL 清扫恢复。
 
 ## 事件与恢复
 
@@ -73,8 +74,10 @@ comments；PR 额外包含 commits、files、reviews、review comments、checks�
 和 GitHub diff media type 的完整 patch。`manifest.json` 记录每个文件的字节数、对象数和
 SHA-256。稳定 thread 提供旧对话，新 evidence 始终覆盖旧事实。
 
-GitHub App 私钥只由仓库外的绝对路径引用，installation token 只驻留内存。源码、
-prompt、SQLite、evidence、Git remote 和日志都不写入凭证。
+GitHub App 私钥只由仓库外的绝对路径引用，installation token 只驻留内存。clone/push
+通过短命 `GIT_ASKPASS` 和禁用全局 credential helper 的子进程执行，remote URL 不含 token。
+comment、COMMENT review 和创建 PR 均调用 App REST API。源码、prompt、SQLite、evidence、
+Git remote 和日志都不写入凭证。
 
 ## 轮询实践
 
