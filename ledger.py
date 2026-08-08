@@ -21,6 +21,7 @@ class ItemState:
     thread_id: str | None
     last_updated_at: str
     last_comment_id: int
+    draft: bool = False
 
 
 @dataclass(frozen=True)
@@ -84,7 +85,7 @@ class EventLedger:
     def establish_baseline(
         self,
         repo: str,
-        items: list[tuple[str, int, str, int]],
+        items: list[tuple[str, int, str, int, bool]],
     ) -> None:
         """Atomically mark every existing item without creating executable events."""
 
@@ -99,12 +100,12 @@ class EventLedger:
                 """
                 INSERT INTO items(
                     repo, kind, number, thread_id, last_updated_at,
-                    last_comment_id, first_seen_at, updated_at
-                ) VALUES (?, ?, ?, NULL, ?, ?, ?, ?)
+                    last_comment_id, draft, first_seen_at, updated_at
+                ) VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?)
                 """,
                 [
-                    (repo, kind, number, updated_at, comment_id, now, now)
-                    for kind, number, updated_at, comment_id in items
+                    (repo, kind, number, updated_at, comment_id, draft, now, now)
+                    for kind, number, updated_at, comment_id, draft in items
                 ],
             )
             connection.execute(
@@ -116,7 +117,8 @@ class EventLedger:
         with self._connect() as connection:
             row = connection.execute(
                 """
-                SELECT repo, kind, number, thread_id, last_updated_at, last_comment_id
+                SELECT repo, kind, number, thread_id, last_updated_at,
+                       last_comment_id, draft
                 FROM items WHERE repo = ? AND kind = ? AND number = ?
                 """,
                 (repo, kind, number),
@@ -130,6 +132,8 @@ class EventLedger:
         number: int,
         updated_at: str,
         last_comment_id: int,
+        *,
+        draft: bool = False,
     ) -> bool:
         now = utc_now()
         with self._connect() as connection:
@@ -137,10 +141,10 @@ class EventLedger:
                 """
                 INSERT OR IGNORE INTO items(
                     repo, kind, number, thread_id, last_updated_at,
-                    last_comment_id, first_seen_at, updated_at
-                ) VALUES (?, ?, ?, NULL, ?, ?, ?, ?)
+                    last_comment_id, draft, first_seen_at, updated_at
+                ) VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?)
                 """,
-                (repo, kind, number, updated_at, last_comment_id, now, now),
+                (repo, kind, number, updated_at, last_comment_id, draft, now, now),
             )
         return cursor.rowcount == 1
 
@@ -152,16 +156,36 @@ class EventLedger:
         *,
         updated_at: str,
         last_comment_id: int,
+        draft: bool | None = None,
     ) -> None:
         with self._connect() as connection:
-            connection.execute(
-                """
-                UPDATE items
-                SET last_updated_at = ?, last_comment_id = ?, updated_at = ?
-                WHERE repo = ? AND kind = ? AND number = ?
-                """,
-                (updated_at, last_comment_id, utc_now(), repo, kind, number),
-            )
+            if draft is None:
+                connection.execute(
+                    """
+                    UPDATE items
+                    SET last_updated_at = ?, last_comment_id = ?, updated_at = ?
+                    WHERE repo = ? AND kind = ? AND number = ?
+                    """,
+                    (updated_at, last_comment_id, utc_now(), repo, kind, number),
+                )
+            else:
+                connection.execute(
+                    """
+                    UPDATE items
+                    SET last_updated_at = ?, last_comment_id = ?, draft = ?,
+                        updated_at = ?
+                    WHERE repo = ? AND kind = ? AND number = ?
+                    """,
+                    (
+                        updated_at,
+                        last_comment_id,
+                        draft,
+                        utc_now(),
+                        repo,
+                        kind,
+                        number,
+                    ),
+                )
 
     def set_thread(self, repo: str, kind: str, number: int, thread_id: str) -> None:
         with self._connect() as connection:
@@ -319,6 +343,7 @@ class EventLedger:
                     thread_id TEXT,
                     last_updated_at TEXT NOT NULL,
                     last_comment_id INTEGER NOT NULL DEFAULT 0,
+                    draft INTEGER NOT NULL DEFAULT 0,
                     first_seen_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     PRIMARY KEY(repo, kind, number)
@@ -343,6 +368,16 @@ class EventLedger:
                         REFERENCES items(repo, kind, number)
                 );
                 """
+            )
+            self._migrate(connection)
+
+    def _migrate(self, connection: sqlite3.Connection) -> None:
+        columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(items)")
+        }
+        if "draft" not in columns:
+            connection.execute(
+                "ALTER TABLE items ADD COLUMN draft INTEGER NOT NULL DEFAULT 0"
             )
 
     def _connect(self) -> sqlite3.Connection:

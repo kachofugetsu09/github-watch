@@ -74,12 +74,18 @@ class GitHubWatch:
 
         # 1. First observation is a silent baseline
         if not self._ledger.has_baseline(repo):
-            baseline: list[tuple[str, int, str, int]] = []
+            baseline: list[tuple[str, int, str, int, bool]] = []
             for kind, item in rows:
                 number, updated_at = self._item_identity(item)
                 comments = self._client.comments(repo, number)
                 baseline.append(
-                    (kind, number, updated_at, self._maximum_comment_id(comments))
+                    (
+                        kind,
+                        number,
+                        updated_at,
+                        self._maximum_comment_id(comments),
+                        self._item_draft(kind, item),
+                    )
                 )
             self._ledger.establish_baseline(repo, baseline)
             logger.info(
@@ -87,17 +93,19 @@ class GitHubWatch:
             )
             return
 
-        # 2. New objects wake once; updates wake only on a new owner mention comment
+        # 2. New objects wake once; updates wake only on a new owner mention
+        #    comment or a draft-to-open transition.
         for kind, item in rows:
             number, updated_at = self._item_identity(item)
+            draft = self._item_draft(kind, item)
             current = self._ledger.get_item(repo, kind, number)
             if current is None:
                 comments = self._client.comments(repo, number)
                 last_comment_id = self._maximum_comment_id(comments)
                 inserted = self._ledger.insert_item(
-                    repo, kind, number, updated_at, last_comment_id
+                    repo, kind, number, updated_at, last_comment_id, draft=draft
                 )
-                if inserted:
+                if inserted and not draft:
                     self._ledger.create_event(
                         event_key=f"{repo}:{kind}:{number}:opened",
                         repo=repo,
@@ -108,6 +116,25 @@ class GitHubWatch:
                     )
                 continue
             if current.last_updated_at == updated_at:
+                continue
+            if draft != current.draft:
+                if not draft:
+                    self._ledger.create_event(
+                        event_key=f"{repo}:{kind}:{number}:ready",
+                        repo=repo,
+                        kind=kind,
+                        number=number,
+                        trigger_kind="ready_for_review",
+                        trigger_id=str(number),
+                    )
+                self._ledger.observe_item(
+                    repo,
+                    kind,
+                    number,
+                    updated_at=updated_at,
+                    last_comment_id=current.last_comment_id,
+                    draft=draft,
+                )
                 continue
             comments = self._client.comments(repo, number)
             for comment in comments:
@@ -318,6 +345,12 @@ message_push 是 fire-and-forget；调用后继续完成 GitHub comment/review�
         if not isinstance(number, int) or not isinstance(updated_at, str):
             raise TypeError("GitHub item missing number/updated_at")
         return number, updated_at
+
+    @staticmethod
+    def _item_draft(kind: str, item: dict[str, Any]) -> bool:
+        if kind != "pr":
+            return False
+        return bool(item.get("draft", False))
 
     @staticmethod
     def _comment_id(comment: dict[str, Any]) -> int:

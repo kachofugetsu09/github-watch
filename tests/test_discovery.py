@@ -102,6 +102,34 @@ def test_only_new_owner_mention_comment_reawakens(tmp_path):
     assert ledger.pending_events() == events
 
 
+def test_draft_pr_is_observed_but_open_transition_wakes(tmp_path):
+    fake = FakeGitHub()
+    fake.pull_rows = [item(9, "t1") | {"draft": True}]
+    watch, ledger = build_watch(tmp_path, fake)
+    watch._discover_repository("owner/repo")
+
+    # Baseline is silent even for a draft PR.
+    assert ledger.pending_events() == []
+
+    # A brand-new draft PR is recorded but never wakes an event.
+    fake.pull_rows.append(item(10, "t2") | {"draft": True})
+    watch._discover_repository("owner/repo")
+    assert ledger.pending_events() == []
+
+    # draft -> open transition creates exactly one ready_for_review event.
+    fake.pull_rows[1]["draft"] = False
+    fake.pull_rows[1]["updated_at"] = "t3"
+    watch._discover_repository("owner/repo")
+    events = ledger.pending_events()
+    assert [event.event_key for event in events] == ["owner/repo:pr:10:ready"]
+    assert events[0].trigger_kind == "ready_for_review"
+
+    # Re-observation after the transition is silent.
+    fake.pull_rows[1]["updated_at"] = "t4"
+    watch._discover_repository("owner/repo")
+    assert ledger.pending_events() == events
+
+
 def test_code_and_longer_login_do_not_count_as_mentions(tmp_path):
     fake = FakeGitHub()
     fake.issue_rows = [item(8, "t1")]
