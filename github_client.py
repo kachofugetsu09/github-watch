@@ -189,6 +189,16 @@ class GitHubClient:
             "comment",
         )
 
+    def add_reaction(self, repo: str, number: int, content: str) -> dict[str, Any]:
+        return self._require_object(
+            self.request(
+                "POST",
+                f"/repos/{repo}/issues/{number}/reactions",
+                body={"content": content},
+            ),
+            "reaction",
+        )
+
     def post_review(self, repo: str, number: int, body: str) -> dict[str, Any]:
         return self._require_object(
             self.request(

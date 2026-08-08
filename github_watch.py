@@ -282,19 +282,15 @@ class GitHubWatch:
             await self._ack_dispatched(event)
 
     async def _ack_dispatched(self, event: EventState) -> None:
-        """Post a receipt emoji on the item once a turn has been admitted."""
+        """React with :eyes: on the item itself once a turn has been admitted."""
 
         if self._operations is None:
             return
         try:
-            await asyncio.to_thread(
-                self._operations.post_comment,
-                event,
-                ":eyes: 已收到，分身开始处理",
-            )
+            await asyncio.to_thread(self._operations.react, event, "eyes")
         except Exception:
             logger.warning(
-                "github-watch ack comment failed event=%s", event.event_key, exc_info=True
+                "github-watch ack reaction failed event=%s", event.event_key, exc_info=True
             )
 
     def _build_prompt(

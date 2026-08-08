@@ -16,6 +16,16 @@ class GitHubOperations:
         self._client = client
         self._checkouts = checkouts
 
+    def react(self, event: EventState, content: str) -> dict[str, Any]:
+        """React to the issue/PR itself instead of posting a receipt comment."""
+
+        result = self._client.add_reaction(event.repo, event.number, content)
+        return {
+            "reaction": result.get("content"),
+            "url": result.get("html_url"),
+            "id": result.get("id"),
+        }
+
     def post_comment(self, event: EventState, body: str) -> dict[str, Any]:
         marker = self._marker(event)
         for comment in self._client.comments(event.repo, event.number):
