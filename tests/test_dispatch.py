@@ -34,9 +34,12 @@ class FakeControl:
     async def __aexit__(self, *_: object) -> None:
         self.closed = True
 
-    async def start_turn(self, thread_id: str, prompt: str) -> FakeHandle:
+    async def start_turn(
+        self, thread_id: str, prompt: str, detached: bool = False
+    ) -> FakeHandle:
         assert thread_id == "thread-1"
         self.prompt = prompt
+        self.detached = detached
         return FakeHandle()
 
 
@@ -87,6 +90,7 @@ def test_dispatch_returns_after_turn_admission_without_waiting_for_result(
     assert dispatched.thread_id == "thread-1"
     assert dispatched.turn_id == "turn-1"
     assert control.closed
+    assert control.detached
     assert control.prompt is not None
     assert "插件不会等待或代发最终回复" in control.prompt
     assert str(checkout) in control.prompt

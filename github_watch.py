@@ -271,7 +271,9 @@ class GitHubWatch:
                 thread_id=thread_id,
             )
             handle = await client.start_turn(
-                thread_id, self._build_prompt(event, manifest, checkout_path)
+                thread_id,
+                self._build_prompt(event, manifest, checkout_path),
+                detached=True,
             )
             self._ledger.transition(
                 event.event_key,

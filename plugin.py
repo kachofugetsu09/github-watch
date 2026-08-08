@@ -72,7 +72,7 @@ class GitHubWatchConfig(BaseModel):
 class GitHubWatchPlugin(Plugin):
     api_version = 2
     name = "github-watch"
-    version = "1.2.6"
+    version = "1.2.7"
     desc = "Poll GitHub and wake one stable Akashic thread per issue or PR"
     ConfigModel = GitHubWatchConfig
 
