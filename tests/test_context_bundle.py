@@ -65,7 +65,6 @@ def test_pr_bundle_contains_complete_views_and_verified_digests(tmp_path):
         "review_comments.json",
         "check_runs.json",
         "combined_status.json",
-        "diff.patch",
     }
     assert set(manifest["files"]) == expected
     for name, record in manifest["files"].items():

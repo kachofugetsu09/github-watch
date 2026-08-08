@@ -15,6 +15,7 @@ from .context_bundle import ContextBundle
 from .checkout import CheckoutManager
 from .github_client import GitHubClient
 from .ledger import EventLedger, EventState
+from .operations import GitHubOperations
 
 logger = logging.getLogger("plugin.github-watch")
 
@@ -32,12 +33,14 @@ class GitHubWatch:
         control_endpoint: str,
         mention: str,
         bot_login: str,
+        operations: GitHubOperations | None = None,
         notify_channel: str | None = None,
         notify_chat_id: str | None = None,
     ) -> None:
         self._client = client
         self._ledger = ledger
         self._checkouts = checkouts
+        self._operations = operations
         self._context = ContextBundle(client, data_dir)
         self._control_endpoint = control_endpoint
         escaped_mention = re.escape(mention.casefold())
@@ -275,6 +278,23 @@ class GitHubWatch:
                 expected=("turn_submitting",),
                 status="dispatched",
                 turn_id=handle.id,
+            )
+            await self._ack_dispatched(event)
+
+    async def _ack_dispatched(self, event: EventState) -> None:
+        """Post a receipt emoji on the item once a turn has been admitted."""
+
+        if self._operations is None:
+            return
+        try:
+            await asyncio.to_thread(
+                self._operations.post_comment,
+                event,
+                ":eyes: 已收到，分身开始处理",
+            )
+        except Exception:
+            logger.warning(
+                "github-watch ack comment failed event=%s", event.event_key, exc_info=True
             )
 
     def _build_prompt(

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import shutil
@@ -16,6 +17,8 @@ from typing import Any
 
 from .github_client import GitHubClient
 from .ledger import EventState
+
+_LOGGER = logging.getLogger("plugin.github-watch")
 
 
 _OPERATION_ID = re.compile(r"^[0-9a-f]{32}$")
@@ -39,14 +42,16 @@ class CheckoutManager:
         client: GitHubClient,
         *,
         root: Path | None = None,
+        mirror_root: Path | None = None,
         ttl_seconds: int = 86_400,
     ) -> None:
         self._client = client
         self.root = root or Path(tempfile.gettempdir()) / "akashic-github-watch"
+        self._mirror_root = mirror_root or self.root / "mirror"
         self._ttl_seconds = ttl_seconds
 
     def prepare(self, event: EventState, item: dict[str, Any]) -> CheckoutState:
-        """Clone one exact repository state without persisting installation credentials."""
+        """Checkout one exact PR head from a persistent mirror without credentials."""
 
         # 1. Establish a unique operation directory and credential-free remote.
         operation_dir = self._operation_dir(event.operation_id)
@@ -55,40 +60,23 @@ class CheckoutManager:
         os.chmod(operation_dir, 0o700)
         repository_dir = operation_dir / "repository"
         try:
-            self._run_authenticated(
-                operation_dir,
-                [
-                    "git",
-                    "-c",
-                    "credential.helper=",
-                    "clone",
-                    "--filter=blob:none",
-                    "--depth=1",
-                    "--no-checkout",
-                    f"https://github.com/{event.repo}.git",
-                    str(repository_dir),
-                ],
-            )
+            # 2. Persist one full mirror per repository; refresh incrementally.
+            mirror = self._ensure_mirror(event.repo, operation_dir)
+            self._refresh_mirror(mirror, operation_dir)
 
-            # 2. Check out the PR head or the repository default branch exactly.
+            # 3. Create a local worktree at the PR head or the default branch.
             if event.kind == "pr":
                 head_sha = self._pr_head_sha(item)
-                self._run_authenticated(
-                    operation_dir,
+                self._run(
                     [
                         "git",
-                        "-c",
-                        "credential.helper=",
                         "-C",
+                        str(mirror),
+                        "worktree",
+                        "add",
                         str(repository_dir),
-                        "fetch",
-                        "--depth=1",
-                        "origin",
                         f"refs/pull/{event.number}/head",
-                    ],
-                )
-                self._run(
-                    ["git", "-C", str(repository_dir), "checkout", "--detach", "FETCH_HEAD"]
+                    ]
                 )
                 actual = self._git_output(repository_dir, "rev-parse", "HEAD")
                 if actual != head_sha:
@@ -96,12 +84,21 @@ class CheckoutManager:
                         f"PR checkout identity mismatch: expected={head_sha} actual={actual}"
                     )
             else:
+                default_branch = self._git_output(mirror, "symbolic-ref", "--short", "HEAD")
                 self._run(
-                    ["git", "-C", str(repository_dir), "checkout", "--detach", "origin/HEAD"]
+                    [
+                        "git",
+                        "-C",
+                        str(mirror),
+                        "worktree",
+                        "add",
+                        str(repository_dir),
+                        default_branch,
+                    ]
                 )
                 head_sha = self._git_output(repository_dir, "rev-parse", "HEAD")
 
-            # 3. Bind commits to the App identity and record non-secret recovery state.
+            # 4. Bind commits to the App identity (shared mirror config, idempotent).
             self._run(
                 [
                     "git",
@@ -154,7 +151,7 @@ class CheckoutManager:
         if pushed_branch is not None and not isinstance(pushed_branch, str):
             raise TypeError(f"invalid checkout branch: {state_path}")
         repository_dir = operation_dir / "repository"
-        if not (repository_dir / ".git").is_dir():
+        if not (repository_dir / ".git").exists():
             raise FileNotFoundError(f"checkout repository missing: {repository_dir}")
         return CheckoutState(operation_id, repo, repository_dir, base_sha, pushed_branch)
 
@@ -195,15 +192,95 @@ class CheckoutManager:
         return branch
 
     def cleanup(self, operation_id: str) -> bool:
-        """Remove exactly one validated operation directory."""
+        """Remove exactly one validated operation directory and its worktree."""
 
         operation_dir = self._operation_dir(operation_id)
         if not operation_dir.exists():
             return False
         if operation_dir.is_symlink() or not operation_dir.is_dir():
             raise RuntimeError(f"refusing unsafe checkout cleanup: {operation_dir}")
+        repository_dir = operation_dir / "repository"
+        self._remove_worktree(repository_dir)
         shutil.rmtree(operation_dir)
         return True
+
+    def _remove_worktree(self, repository_dir: Path) -> None:
+        """Detach one operation worktree from its mirror when a worktree exists."""
+
+        gitfile = repository_dir / ".git"
+        if not gitfile.is_file():
+            return
+        raw = gitfile.read_text(encoding="utf-8", errors="replace").strip()
+        if not raw.startswith("gitdir:"):
+            return
+        gitdir = Path(raw.split(":", 1)[1].strip())
+        if not gitdir.is_absolute() or not gitdir.is_dir():
+            return
+        mirror = gitdir.parent.parent.parent
+        if not (mirror / "objects").is_dir() or not (mirror / "HEAD").is_file():
+            return
+        try:
+            self._run(
+                [
+                    "git",
+                    "-C",
+                    str(mirror),
+                    "worktree",
+                    "remove",
+                    "--force",
+                    str(repository_dir),
+                ]
+            )
+        except Exception:
+            logger = _LOGGER
+            if logger is not None:
+                logger.warning(
+                    "github-watch worktree remove failed path=%s", repository_dir
+                )
+
+    def _mirror_path(self, repo: str) -> Path:
+        owner, name = repo.split("/", 1)
+        return self._mirror_root / owner / f"{name}.git"
+
+    def _ensure_mirror(self, repo: str, operation_dir: Path) -> Path:
+        """Clone the repository once as a bare mirror; reuse it afterwards."""
+
+        mirror = self._mirror_path(repo)
+        if (mirror / "HEAD").is_file() and (mirror / "objects").is_dir():
+            return mirror
+        mirror.parent.mkdir(parents=True, exist_ok=True)
+        self._run_authenticated(
+            operation_dir,
+            [
+                "git",
+                "-c",
+                "credential.helper=",
+                "clone",
+                "--mirror",
+                f"https://github.com/{repo}.git",
+                str(mirror),
+            ],
+        )
+        return mirror
+
+    def _refresh_mirror(self, mirror: Path, operation_dir: Path) -> None:
+        """Incrementally fetch open PR heads and branch refs into the mirror."""
+
+        self._run_authenticated(
+            operation_dir,
+            [
+                "git",
+                "-c",
+                "credential.helper=",
+                "-C",
+                str(mirror),
+                "fetch",
+                "origin",
+                "--prune",
+                "+refs/pull/*/head:refs/pull/*/head",
+                "+refs/heads/*:refs/heads/*",
+            ],
+        )
 
     def sweep(self) -> int:
         """Remove expired operation directories left by interrupted turns."""

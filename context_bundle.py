@@ -32,7 +32,6 @@ class ContextBundle:
             "issue_comments.json": self._client.comments(event.repo, event.number),
             "timeline.json": self._client.timeline(event.repo, event.number),
         }
-        text_payloads: dict[str, str] = {}
         if event.kind == "pr":
             head = item.get("head")
             if not isinstance(head, dict) or not isinstance(head.get("sha"), str):
@@ -52,9 +51,6 @@ class ContextBundle:
                     ),
                 }
             )
-            text_payloads["diff.patch"] = self._client.pull_diff(
-                event.repo, event.number
-            )
 
         # 2. Write immutable evidence and a digest manifest
         bundle_dir = self._root / "evidence" / event.operation_id
@@ -64,10 +60,6 @@ class ContextBundle:
             raw = (json.dumps(payload, ensure_ascii=False, indent=2) + "\n").encode()
             (bundle_dir / name).write_bytes(raw)
             digests[name] = self._digest(raw, payload)
-        for name, text in text_payloads.items():
-            raw = text.encode()
-            (bundle_dir / name).write_bytes(raw)
-            digests[name] = self._digest(raw, None)
 
         manifest = {
             "schema_version": 1,

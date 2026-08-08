@@ -72,7 +72,7 @@ class GitHubWatchConfig(BaseModel):
 class GitHubWatchPlugin(Plugin):
     api_version = 2
     name = "github-watch"
-    version = "1.2.4"
+    version = "1.2.5"
     desc = "Poll GitHub and wake one stable Akashic thread per issue or PR"
     ConfigModel = GitHubWatchConfig
 
@@ -101,6 +101,8 @@ class GitHubWatchPlugin(Plugin):
         )
         checkouts = CheckoutManager(
             client,
+            root=data_dir / "checkouts",
+            mirror_root=data_dir / "mirror",
             ttl_seconds=config.checkout_ttl_seconds,
         )
         removed = checkouts.sweep()
@@ -117,6 +119,7 @@ class GitHubWatchPlugin(Plugin):
             control_endpoint=endpoint,
             mention=config.mention,
             bot_login=config.bot_login,
+            operations=self._operations,
             notify_channel=config.notify_channel,
             notify_chat_id=config.notify_chat_id,
         )
