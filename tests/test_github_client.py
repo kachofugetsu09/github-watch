@@ -176,6 +176,31 @@ def test_write_transport_failure_is_never_retried() -> None:
     assert urlopen.call_count == 1
 
 
+def test_installation_token_exchange_retries_transport_failure() -> None:
+    client = transport_client()
+    path = f"/app/installations/{client._installation_id}/access_tokens"
+    failure = urllib.error.URLError(ssl.SSLEOFError(8, "unexpected eof"))
+
+    with (
+        patch(
+            "github_watch_test_package.github_client.urllib.request.urlopen",
+            side_effect=[failure, FakeResponse(b'{"token": "fresh"}')],
+        ) as urlopen,
+        patch("github_watch_test_package.github_client.time.sleep") as sleep,
+    ):
+        raw, _, status = client._request_raw(
+            "POST",
+            path,
+            token="app-jwt",
+            body={},
+        )
+
+    assert json.loads(raw) == {"token": "fresh"}
+    assert status == 200
+    assert urlopen.call_count == 2
+    assert sleep.call_count == 1
+
+
 def test_get_retry_exhaustion_enters_cooldown_then_recovers() -> None:
     client = transport_client()
     now = [1_000.0]

@@ -298,9 +298,10 @@ class GitHubClient:
         """Execute a request while preserving cache and rate-limit metadata."""
 
         # 1. Honor server and transport cooldowns before issuing another request.
+        retry_transport = self._transport_retry_safe(method, path)
         if token is None and time.time() < self._blocked_until:
             raise GitHubRateLimited(method, path, self._blocked_until, "local backoff")
-        if method == "GET" and time.time() < self._transport_blocked_until:
+        if retry_transport and time.time() < self._transport_blocked_until:
             raise GitHubTransportUnavailable(
                 method,
                 path,
@@ -322,8 +323,8 @@ class GitHubClient:
             f"{API}{path}", data=data, method=method, headers=request_headers
         )
 
-        # 2. Retry only idempotent GET transport failures; writes remain single-shot.
-        attempts = TRANSPORT_MAX_ATTEMPTS if method == "GET" else 1
+        # 2. Retry read traffic and auth bootstrap; business writes stay single-shot.
+        attempts = TRANSPORT_MAX_ATTEMPTS if retry_transport else 1
         for attempt in range(1, attempts + 1):
             try:
                 with urllib.request.urlopen(request, timeout=30) as response:
@@ -351,7 +352,7 @@ class GitHubClient:
                 TimeoutError,
                 ssl.SSLEOFError,
             ) as error:
-                if method != "GET" or not self._is_transient_transport_error(error):
+                if not retry_transport or not self._is_transient_transport_error(error):
                     raise
                 if attempt < attempts:
                     time.sleep(TRANSPORT_RETRY_DELAYS[attempt - 1])
@@ -367,6 +368,15 @@ class GitHubClient:
                     detail=f"{type(error).__name__}: {error}",
                 ) from error
         raise AssertionError("GitHub transport retry loop exhausted without result")
+
+    def _transport_retry_safe(self, method: str, path: str) -> bool:
+        if method == "GET":
+            return True
+        return (
+            method == "POST"
+            and path
+            == f"/app/installations/{self._installation_id}/access_tokens"
+        )
 
     def _make_jwt(self) -> str:
         now = int(time.time())
