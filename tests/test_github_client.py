@@ -1,10 +1,43 @@
 from __future__ import annotations
 
+import http.client
 import json
+import ssl
+import urllib.error
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
-from github_watch_test_package.github_client import GitHubClient
+import pytest
+
+from github_watch_test_package.github_client import (
+    TRANSPORT_COOLDOWN_SECONDS,
+    GitHubClient,
+    GitHubTransportUnavailable,
+)
+
+
+class FakeResponse:
+    def __init__(self, payload: bytes = b"{}") -> None:
+        self._payload = payload
+        self.headers: dict[str, str] = {}
+        self.status = 200
+
+    def __enter__(self) -> "FakeResponse":
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        return None
+
+    def read(self) -> bytes:
+        return self._payload
+
+
+def transport_client() -> GitHubClient:
+    client = GitHubClient(app_id=1, installation_id=2, pem_path=Path("unused"))
+    client._token = "token"
+    client._token_expires_at = float("inf")
+    return client
 
 
 class FakePagedClient(GitHubClient):
@@ -106,3 +139,106 @@ def test_review_and_pull_writes_use_rest_endpoints_and_comment_review_event() ->
             },
         ),
     ]
+
+
+def test_get_retries_transient_tls_and_partial_read_failures() -> None:
+    client = transport_client()
+    failures = [
+        urllib.error.URLError(ssl.SSLEOFError(8, "unexpected eof")),
+        http.client.IncompleteRead(b"partial", 10),
+        FakeResponse(b'{"ok": true}'),
+    ]
+
+    with (
+        patch(
+            "github_watch_test_package.github_client.urllib.request.urlopen",
+            side_effect=failures,
+        ) as urlopen,
+        patch("github_watch_test_package.github_client.time.sleep") as sleep,
+    ):
+        assert client.request("GET", "/repos/owner/repo") == {"ok": True}
+
+    assert urlopen.call_count == 3
+    assert sleep.call_count == 2
+
+
+def test_write_transport_failure_is_never_retried() -> None:
+    client = transport_client()
+    failure = urllib.error.URLError(ssl.SSLEOFError(8, "unexpected eof"))
+
+    with patch(
+        "github_watch_test_package.github_client.urllib.request.urlopen",
+        side_effect=failure,
+    ) as urlopen:
+        with pytest.raises(urllib.error.URLError):
+            client.request("POST", "/repos/owner/repo/issues/1/comments", body={})
+
+    assert urlopen.call_count == 1
+
+
+def test_get_retry_exhaustion_enters_cooldown_then_recovers() -> None:
+    client = transport_client()
+    now = [1_000.0]
+    failure = urllib.error.URLError(ssl.SSLEOFError(8, "unexpected eof"))
+
+    with (
+        patch(
+            "github_watch_test_package.github_client.urllib.request.urlopen",
+            side_effect=failure,
+        ) as urlopen,
+        patch("github_watch_test_package.github_client.time.sleep"),
+        patch(
+            "github_watch_test_package.github_client.time.time",
+            side_effect=lambda: now[0],
+        ),
+    ):
+        with pytest.raises(GitHubTransportUnavailable) as exhausted:
+            client.request("GET", "/repos/owner/repo")
+        assert exhausted.value.attempts == 3
+        assert exhausted.value.retry_at == now[0] + TRANSPORT_COOLDOWN_SECONDS
+
+        with pytest.raises(GitHubTransportUnavailable) as cooldown:
+            client.request("GET", "/repos/owner/repo")
+        assert cooldown.value.attempts == 0
+        assert urlopen.call_count == 3
+
+    now[0] += TRANSPORT_COOLDOWN_SECONDS
+    with (
+        patch(
+            "github_watch_test_package.github_client.urllib.request.urlopen",
+            return_value=FakeResponse(b'{"ok": true}'),
+        ),
+        patch(
+            "github_watch_test_package.github_client.time.time",
+            side_effect=lambda: now[0],
+        ),
+    ):
+        assert client.request("GET", "/repos/owner/repo") == {"ok": True}
+    assert client._transport_blocked_until == 0.0
+
+
+def test_http_not_modified_marks_transport_recovered() -> None:
+    client = transport_client()
+    client._transport_degraded = True
+    response = urllib.error.HTTPError(
+        "https://api.github.com/repos/owner/repo/issues",
+        304,
+        "Not Modified",
+        {},
+        None,
+    )
+
+    with patch(
+        "github_watch_test_package.github_client.urllib.request.urlopen",
+        side_effect=response,
+    ):
+        raw, _, status = client._request_raw(
+            "GET",
+            "/repos/owner/repo/issues",
+            allow_not_modified=True,
+        )
+
+    assert raw == b""
+    assert status == 304
+    assert client._transport_degraded is False
+    assert client._transport_blocked_until == 0.0

@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import base64
+import http.client
 import json
+import logging
+import ssl
 import subprocess
 import time
 import urllib.error
@@ -16,6 +19,11 @@ from typing import Any
 API = "https://api.github.com"
 API_VERSION = "2022-11-28"
 DEFAULT_ACCEPT = "application/vnd.github+json"
+TRANSPORT_MAX_ATTEMPTS = 3
+TRANSPORT_RETRY_DELAYS = (0.25, 1.0)
+TRANSPORT_COOLDOWN_SECONDS = 300
+
+logger = logging.getLogger("plugin.github-watch")
 
 
 class GitHubApiError(RuntimeError):
@@ -30,6 +38,26 @@ class GitHubRateLimited(GitHubApiError):
         self.retry_at = retry_at
 
 
+class GitHubTransportUnavailable(RuntimeError):
+    """Report exhausted GET retries or an active transport cooldown."""
+
+    def __init__(
+        self,
+        method: str,
+        path: str,
+        *,
+        retry_at: float,
+        attempts: int,
+        detail: str,
+    ) -> None:
+        super().__init__(
+            f"GitHub transport {method} {path} unavailable until "
+            f"{retry_at:.3f}: {detail}"
+        )
+        self.retry_at = retry_at
+        self.attempts = attempts
+
+
 class GitHubClient:
     """Authenticate as one GitHub App installation and expose REST operations."""
 
@@ -40,6 +68,8 @@ class GitHubClient:
         self._token = ""
         self._token_expires_at = 0.0
         self._blocked_until = 0.0
+        self._transport_blocked_until = 0.0
+        self._transport_degraded = False
         self._page_cache: dict[str, tuple[str, Any, str | None]] = {}
 
     def installation_token(self) -> str:
@@ -267,9 +297,17 @@ class GitHubClient:
     ) -> tuple[bytes, Any, int]:
         """Execute a request while preserving cache and rate-limit metadata."""
 
-        # 1. Honor a server-declared limit without issuing more HTTP requests
+        # 1. Honor server and transport cooldowns before issuing another request.
         if token is None and time.time() < self._blocked_until:
             raise GitHubRateLimited(method, path, self._blocked_until, "local backoff")
+        if method == "GET" and time.time() < self._transport_blocked_until:
+            raise GitHubTransportUnavailable(
+                method,
+                path,
+                retry_at=self._transport_blocked_until,
+                attempts=0,
+                detail="local transport cooldown",
+            )
         auth = token or self.installation_token()
         request_headers = {
             "Authorization": f"Bearer {auth}",
@@ -284,20 +322,51 @@ class GitHubClient:
             f"{API}{path}", data=data, method=method, headers=request_headers
         )
 
-        # 2. Preserve a 304 and classify explicit throttling separately
-        try:
-            with urllib.request.urlopen(request, timeout=30) as response:
-                return response.read(), response.headers, response.status
-        except urllib.error.HTTPError as error:
-            if error.code == 304 and allow_not_modified:
-                return b"", error.headers, 304
-            detail = error.read().decode(errors="replace")[:1000]
-            if error.code in (403, 429):
-                retry_at = self._retry_at(error.headers)
-                if retry_at is not None:
-                    self._blocked_until = retry_at
-                    raise GitHubRateLimited(method, path, retry_at, detail) from error
-            raise GitHubApiError(method, path, error.code, detail) from error
+        # 2. Retry only idempotent GET transport failures; writes remain single-shot.
+        attempts = TRANSPORT_MAX_ATTEMPTS if method == "GET" else 1
+        for attempt in range(1, attempts + 1):
+            try:
+                with urllib.request.urlopen(request, timeout=30) as response:
+                    raw = response.read()
+                    self._mark_transport_recovered()
+                    return raw, response.headers, response.status
+            except urllib.error.HTTPError as error:
+                self._mark_transport_recovered()
+                if error.code == 304 and allow_not_modified:
+                    return b"", error.headers, 304
+                detail = error.read().decode(errors="replace")[:1000]
+                if error.code in (403, 429):
+                    retry_at = self._retry_at(error.headers)
+                    if retry_at is not None:
+                        self._blocked_until = retry_at
+                        raise GitHubRateLimited(
+                            method, path, retry_at, detail
+                        ) from error
+                raise GitHubApiError(method, path, error.code, detail) from error
+            except (
+                urllib.error.URLError,
+                http.client.IncompleteRead,
+                http.client.RemoteDisconnected,
+                ConnectionError,
+                TimeoutError,
+                ssl.SSLEOFError,
+            ) as error:
+                if method != "GET" or not self._is_transient_transport_error(error):
+                    raise
+                if attempt < attempts:
+                    time.sleep(TRANSPORT_RETRY_DELAYS[attempt - 1])
+                    continue
+                retry_at = time.time() + TRANSPORT_COOLDOWN_SECONDS
+                self._transport_blocked_until = retry_at
+                self._transport_degraded = True
+                raise GitHubTransportUnavailable(
+                    method,
+                    path,
+                    retry_at=retry_at,
+                    attempts=attempt,
+                    detail=f"{type(error).__name__}: {error}",
+                ) from error
+        raise AssertionError("GitHub transport retry loop exhausted without result")
 
     def _make_jwt(self) -> str:
         now = int(time.time())
@@ -346,6 +415,30 @@ class GitHubClient:
         if remaining == "0" and reset and str(reset).isdigit():
             return float(reset)
         return None
+
+    @classmethod
+    def _is_transient_transport_error(cls, error: BaseException) -> bool:
+        if isinstance(error, urllib.error.URLError):
+            reason = error.reason
+            if isinstance(reason, ssl.SSLCertVerificationError):
+                return False
+            return isinstance(reason, (OSError, TimeoutError))
+        return isinstance(
+            error,
+            (
+                http.client.IncompleteRead,
+                http.client.RemoteDisconnected,
+                ConnectionError,
+                TimeoutError,
+                ssl.SSLEOFError,
+            ),
+        )
+
+    def _mark_transport_recovered(self) -> None:
+        if self._transport_degraded:
+            logger.info("github-watch GitHub transport recovered")
+        self._transport_degraded = False
+        self._transport_blocked_until = 0.0
 
     @staticmethod
     def _b64url(data: bytes) -> str:

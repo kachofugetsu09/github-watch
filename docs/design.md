@@ -89,9 +89,14 @@ Git remote 和日志都不写入凭证。
 
 ## 轮询实践
 
-请求使用认证、固定周期、稳定排序和串行调度。分页跟随 GitHub `Link` header，
-每页保留 ETag 并发送 `If-None-Match`；`304` 复用已验证页。`Retry-After` 或
-rate-limit reset 存在时，客户端在本地阻断新 HTTP 请求直到恢复时间。
+请求使用认证、默认 120 秒周期、稳定排序和串行调度。稳定事件键和 SQLite 账本阻止同一
+Issue/PR 被重复处理；列表仍会按周期检查，但每页保留 ETag 并发送 `If-None-Match`，
+`304` 复用已验证页。`Retry-After` 或 rate-limit reset 存在时，客户端在本地阻断新 HTTP
+请求直到恢复时间。
+
+GET 遇到短暂 TLS、连接或不完整响应时最多尝试三次；仍失败则进入五分钟传输冷却，避免
+后台任务每轮制造重复请求和完整异常栈。恢复后的首个 HTTP 响应记录一次恢复日志。comment、
+review 等写请求保持单次发送，传输结果不确定时绝不自动重试。
 
 参考：
 

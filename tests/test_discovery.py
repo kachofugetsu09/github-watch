@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from typing import Any
 
+from github_watch_test_package.github_client import GitHubTransportUnavailable
 from github_watch_test_package.github_watch import GitHubWatch
 from github_watch_test_package.ledger import EventLedger
 
@@ -26,6 +28,11 @@ class FakeGitHub:
         return self.comment_rows.get(number, [])
 
 
+class FakeCheckouts:
+    def sweep(self) -> list[str]:
+        return []
+
+
 def item(number: int, updated_at: str) -> dict[str, Any]:
     return {"number": number, "updated_at": updated_at}
 
@@ -39,13 +46,36 @@ def build_watch(tmp_path: Path, fake: FakeGitHub) -> tuple[GitHubWatch, EventLed
     watch = GitHubWatch(
         client=fake,  # type: ignore[arg-type]
         ledger=ledger,
-        checkouts=object(),  # type: ignore[arg-type]
+        checkouts=FakeCheckouts(),  # type: ignore[arg-type]
         data_dir=tmp_path,
         control_endpoint="unused.sock",
         mention="@akashic-review-bot",
         bot_login="akashic-review-bot[bot]",
     )
     return watch, ledger
+
+
+def test_poll_contains_exhausted_transport_failure(
+    tmp_path: Path,
+    caplog,
+) -> None:
+    fake = FakeGitHub()
+
+    def unavailable(_repo: str) -> dict[str, Any]:
+        raise GitHubTransportUnavailable(
+            "GET",
+            "/repos/owner/repo",
+            retry_at=1_300.0,
+            attempts=3,
+            detail="unexpected eof",
+        )
+
+    fake.repository = unavailable  # type: ignore[method-assign]
+    watch, _ = build_watch(tmp_path, fake)
+
+    asyncio.run(watch.poll(["owner/repo"]))
+
+    assert "GET retries exhausted" in caplog.text
 
 
 def test_baseline_is_silent_and_new_items_are_once_only(tmp_path):

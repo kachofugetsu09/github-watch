@@ -36,7 +36,7 @@ class GitHubWatchConfig(BaseModel):
     repositories: list[str] = Field(min_length=1)
     mention: str = "@akashic-review-bot"
     bot_login: str = "akashic-review-bot[bot]"
-    poll_seconds: int = Field(default=60, ge=15)
+    poll_seconds: int = Field(default=120, ge=15)
     checkout_ttl_seconds: int = Field(default=86_400, ge=300)
     control_endpoint: str | None = None
     notify_channel: str | None = None
@@ -72,7 +72,7 @@ class GitHubWatchConfig(BaseModel):
 class GitHubWatchPlugin(Plugin):
     api_version = 2
     name = "github-watch"
-    version = "1.2.7"
+    version = "1.2.8"
     desc = "Poll GitHub and wake one stable Akashic thread per issue or PR"
     ConfigModel = GitHubWatchConfig
 

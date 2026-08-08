@@ -13,7 +13,7 @@ from agent.control.client import ControlClient
 
 from .context_bundle import ContextBundle
 from .checkout import CheckoutManager
-from .github_client import GitHubClient
+from .github_client import GitHubClient, GitHubTransportUnavailable
 from .ledger import EventLedger, EventState
 from .operations import GitHubOperations
 
@@ -61,7 +61,25 @@ class GitHubWatch:
 
         # 2. Discover events and advance observation cursors
         for repo in repositories:
-            await asyncio.to_thread(self._discover_repository, repo)
+            try:
+                await asyncio.to_thread(self._discover_repository, repo)
+            except GitHubTransportUnavailable as exc:
+                if exc.attempts > 0:
+                    logger.warning(
+                        "github-watch GitHub GET retries exhausted; "
+                        "cooldown active repo=%s attempts=%d retry_at=%.3f",
+                        repo,
+                        exc.attempts,
+                        exc.retry_at,
+                    )
+                else:
+                    logger.debug(
+                        "github-watch transport cooldown skips poll "
+                        "repo=%s retry_at=%.3f",
+                        repo,
+                        exc.retry_at,
+                    )
+                return
 
         # 3. Run only durable events that have never begun an external effect
         for event in self._ledger.pending_events():
@@ -181,6 +199,21 @@ class GitHubWatch:
             if not isinstance(item, dict):
                 raise TypeError("github-watch item evidence is not an object")
             checkout = await asyncio.to_thread(self._checkouts.prepare, event, item)
+        except GitHubTransportUnavailable as exc:
+            await asyncio.to_thread(self._checkouts.cleanup, event.operation_id)
+            self._ledger.transition(
+                event.event_key,
+                expected=("claimed",),
+                status="discovered",
+                error=repr(exc),
+            )
+            logger.warning(
+                "github-watch context paused by GitHub transport cooldown; "
+                "retry next poll event=%s retry_at=%.3f",
+                event.event_key,
+                exc.retry_at,
+            )
+            return
         except Exception as exc:
             await asyncio.to_thread(self._checkouts.cleanup, event.operation_id)
             self._ledger.transition(
