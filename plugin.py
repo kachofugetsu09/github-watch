@@ -72,12 +72,12 @@ class GitHubWatchConfig(BaseModel):
 class GitHubWatchPlugin(Plugin):
     api_version = 2
     name = "github-watch"
-    version = "1.2.11"
+    version = "1.2.12"
     desc = "Poll GitHub and wake one stable Akashic thread per issue or PR"
     ConfigModel = GitHubWatchConfig
 
     def activate(self) -> None:
-        """Initialize the durable ledger after the generation becomes active."""
+        """校验运行前提，并等待正式调用绑定当前 plugin-data。"""
 
         config = cast(GitHubWatchConfig, self.context.config)
         data_dir = self.context.data_dir
@@ -87,6 +87,22 @@ class GitHubWatchPlugin(Plugin):
         pem_path = Path(config.pem_path).expanduser()
         if not pem_path.is_file():
             raise FileNotFoundError(f"GitHub App PEM does not exist: {pem_path}")
+        self._runtime_data_dir: Path | None = None
+
+    def _ensure_runtime(self) -> None:
+        """为当前 generation 的正式 plugin-data 初始化持久状态与 GitHub 客户端。"""
+
+        # 1. 候选先使用隔离目录，正式切换后必须按当前 context 重新绑定。
+        config = cast(GitHubWatchConfig, self.context.config)
+        data_dir = self.context.data_dir
+        workspace = self.context.workspace
+        if data_dir is None or workspace is None:
+            raise RuntimeError("github-watch requires plugin data_dir and workspace")
+        if self._runtime_data_dir == data_dir:
+            return
+
+        # 2. 初始化当前目录对应的账本、checkout 与远程操作。
+        pem_path = Path(config.pem_path).expanduser()
         data_dir.mkdir(parents=True, exist_ok=True)
         ledger = EventLedger(data_dir / "events.sqlite3")
         ledger.integrity_check()
@@ -123,6 +139,7 @@ class GitHubWatchPlugin(Plugin):
             notify_channel=config.notify_channel,
             notify_chat_id=config.notify_chat_id,
         )
+        self._runtime_data_dir = data_dir
 
     def jobs(self) -> list[PluginJobSpec]:
         config = cast(GitHubWatchConfig, self.context.config)
@@ -136,6 +153,7 @@ class GitHubWatchPlugin(Plugin):
         ]
 
     async def poll(self, ctx: PluginJobContext) -> None:
+        self._ensure_runtime()
         config = cast(GitHubWatchConfig, ctx.plugin_context.config)
         await self._watch.poll(config.repositories)
 
@@ -266,6 +284,7 @@ class GitHubWatchPlugin(Plugin):
         return json.dumps(result, ensure_ascii=False, sort_keys=True)
 
     def _authorized_event(self, operation_id: str) -> EventState:
+        self._ensure_runtime()
         context = get_current_tool_context()
         if context is None or not context.origin_session_key:
             raise PermissionError("github-watch tool requires a live turn context")
@@ -295,6 +314,7 @@ class GitHubWatchPlugin(Plugin):
         return event
 
     def _cleanup_turn(self, session_key: str, turn_id: str) -> None:
+        self._ensure_runtime()
         event = self._ledger.get_event_by_turn(turn_id)
         if event is None or event.thread_id != session_key:
             return
