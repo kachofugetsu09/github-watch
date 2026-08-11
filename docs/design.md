@@ -29,7 +29,7 @@
 └──────────┬───────────┘
            ▼
 ┌──────────────────────┐
-│ Evidence + checkout  │  full pages + PR diff + /tmp exact head
+│ Evidence + checkout  │  full pages + persistent mirror + detached commit
 └──────────┬───────────┘
            ▼
 ┌──────────────────────┐
@@ -47,8 +47,9 @@
 
 GitHub 保存远程权威事实；`events.sqlite3` 保存消费和恢复事实；Akashic
 `sessions.db` 只追加稳定 thread 与 turn 消息。thread metadata 关闭 memory retrieval 和
-post-memory，避免 GitHub 任务进入长期记忆。每个 operation 使用唯一 `/tmp` checkout；
-after-turn 按 control turn ID 找回 operation 并删除，进程中断时由轮询 TTL 清扫恢复。
+post-memory，避免 GitHub 任务进入长期记忆。每个仓库在 `plugin-data` 中复用裸镜像，每个
+operation 从精确提交创建唯一 detached worktree；after-turn 按 control turn ID 找回并删除，
+进程中断时由轮询 TTL 清扫工作目录，并在下次 fetch 前 prune 已失效的 worktree 管理记录。
 
 配置通知目标时，prompt 允许 Agent 在需要维护者决策、关键阻塞/风险或极重要结果时，向固定主
 channel 调用一次 `message_push`。通知不取代 GitHub comment/review，不等待主 channel 回复；普通

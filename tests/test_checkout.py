@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+import shutil
+import subprocess
 import time
 from pathlib import Path
 
@@ -65,7 +67,9 @@ def test_prepare_pr_binds_exact_head_and_cleanup(tmp_path: Path, monkeypatch) ->
     assert state.base_sha == "deadbeef"
     assert (state.path.parent / "state.json").stat().st_mode & 0o777 == 0o600
     assert any(
-        "worktree" in command and "refs/pull/7/head" in command
+        "worktree" in command
+        and "--detach" in command
+        and "refs/pull/7/head" in command
         for command in commands
     )
     assert any(
@@ -75,6 +79,44 @@ def test_prepare_pr_binds_exact_head_and_cleanup(tmp_path: Path, monkeypatch) ->
     assert manager.get("a" * 32) == state
     assert manager.cleanup("a" * 32)
     assert not state.path.parent.exists()
+
+
+def test_prepare_issue_detaches_exact_default_branch_head(
+    tmp_path: Path, monkeypatch
+) -> None:
+    manager = CheckoutManager(
+        FakeClient(),
+        root=tmp_path / "checkouts",
+        mirror_root=tmp_path / "mirror",
+    )  # type: ignore[arg-type]
+    mirror = tmp_path / "mirror" / "owner" / "repo.git"
+    (mirror / "objects").mkdir(parents=True)
+    (mirror / "HEAD").write_text("ref: refs/heads/main\n")
+    commands: list[list[str]] = []
+
+    def run(command: list[str], **_kwargs: object) -> None:
+        commands.append(command)
+        if "worktree" in command and "add" in command:
+            (Path(command[-2]) / ".git").mkdir(parents=True)
+
+    def git_output(_repository: Path, *arguments: str) -> str:
+        if arguments[:2] == ("symbolic-ref", "--short"):
+            return "main"
+        if arguments[0] == "rev-parse":
+            return "deadbeef"
+        raise AssertionError(arguments)
+
+    monkeypatch.setattr(manager, "_run_authenticated", lambda *_args: None)
+    monkeypatch.setattr(manager, "_run", run)
+    monkeypatch.setattr(manager, "_git_output", git_output)
+
+    state = manager.prepare(event(kind="issue"), {})
+
+    assert state.base_sha == "deadbeef"
+    assert any(
+        command[-4:] == ["add", "--detach", str(state.path), "deadbeef"]
+        for command in commands
+    )
 
 
 def test_mirror_is_cloned_once_and_reused(tmp_path: Path, monkeypatch) -> None:
@@ -125,6 +167,40 @@ def test_mirror_is_cloned_once_and_reused(tmp_path: Path, monkeypatch) -> None:
     fetches = [command for command in authenticated_commands if "fetch" in command]
     assert len(fetches) == 2
     assert any("+refs/pull/*/head:refs/pull/*/head" in command for command in fetches)
+
+
+def test_refresh_prunes_missing_attached_worktree_before_fetch(tmp_path: Path) -> None:
+    source, mirror = _create_local_mirror(tmp_path)
+    checkout = tmp_path / "missing-worktree"
+    _git(mirror, "worktree", "add", str(checkout), "main")
+    shutil.rmtree(checkout)
+    expected = _advance_main(source)
+    manager = CheckoutManager(FakeClient())  # type: ignore[arg-type]
+    manager._run_authenticated = (  # type: ignore[method-assign]
+        lambda _operation, command: manager._run(command)
+    )
+
+    manager._refresh_mirror(mirror, tmp_path)
+
+    assert _git_output(mirror, "rev-parse", "refs/heads/main") == expected
+    assert "prunable" not in _git_output(mirror, "worktree", "list", "--porcelain")
+
+
+def test_active_detached_worktree_does_not_block_fetch(tmp_path: Path) -> None:
+    source, mirror = _create_local_mirror(tmp_path)
+    checkout = tmp_path / "detached-worktree"
+    head = _git_output(mirror, "rev-parse", "refs/heads/main")
+    _git(mirror, "worktree", "add", "--detach", str(checkout), head)
+    expected = _advance_main(source)
+    manager = CheckoutManager(FakeClient())  # type: ignore[arg-type]
+    manager._run_authenticated = (  # type: ignore[method-assign]
+        lambda _operation, command: manager._run(command)
+    )
+
+    manager._refresh_mirror(mirror, tmp_path)
+
+    assert _git_output(mirror, "rev-parse", "refs/heads/main") == expected
+    assert _git_output(checkout, "rev-parse", "--abbrev-ref", "HEAD") == "HEAD"
 
 
 def test_cleanup_removes_attached_worktree(tmp_path: Path, monkeypatch) -> None:
@@ -180,3 +256,52 @@ def test_cleanup_rejects_invalid_operation_identity(tmp_path: Path) -> None:
     manager = CheckoutManager(FakeClient(), root=tmp_path)  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="invalid operation_id"):
         manager.cleanup("../escape")
+
+
+def _create_local_mirror(tmp_path: Path) -> tuple[Path, Path]:
+    """Create a local origin, one commit, and its bare mirror."""
+
+    source = tmp_path / "source"
+    origin = tmp_path / "origin.git"
+    mirror = tmp_path / "mirror.git"
+    _git(tmp_path, "init", "--bare", str(origin))
+    _git(tmp_path, "init", "-b", "main", str(source))
+    _git(source, "config", "user.name", "Test User")
+    _git(source, "config", "user.email", "test@example.com")
+    (source / "README.md").write_text("initial\n", encoding="utf-8")
+    _git(source, "add", "README.md")
+    _git(source, "commit", "-m", "initial")
+    _git(source, "remote", "add", "origin", str(origin))
+    _git(source, "push", "-u", "origin", "main")
+    _git(tmp_path, "clone", "--mirror", str(origin), str(mirror))
+    return source, mirror
+
+
+def _advance_main(source: Path) -> str:
+    """Create and push one source commit, returning its SHA."""
+
+    readme = source / "README.md"
+    readme.write_text(readme.read_text(encoding="utf-8") + "next\n", encoding="utf-8")
+    _git(source, "add", "README.md")
+    _git(source, "commit", "-m", "next")
+    _git(source, "push", "origin", "main")
+    return _git_output(source, "rev-parse", "HEAD")
+
+
+def _git(repository: Path, *arguments: str) -> None:
+    subprocess.run(
+        ["git", "-C", str(repository), *arguments],
+        check=True,
+        text=True,
+        capture_output=True,
+    )
+
+
+def _git_output(repository: Path, *arguments: str) -> str:
+    result = subprocess.run(
+        ["git", "-C", str(repository), *arguments],
+        check=True,
+        text=True,
+        capture_output=True,
+    )
+    return result.stdout.strip()

@@ -12,8 +12,8 @@ Akashic API v2 轮询插件，不使用 webhook。
 - 只有仓库 owner 新发的、包含 `@akashic-review-bot` 的 comment 可以再次唤醒。
 - 每个 Issue/PR 复用同一 Control thread；每次都会生成新的完整证据包。
 - 插件只等 `turn/start` 入队成功，不等待 turn 完成，也不接收或代发最终回复。
-- 每次 turn 在 `/tmp/akashic-github-watch/<operation-id>/repository` 使用 GitHub App token
-  clone 精确仓库状态；after-turn 删除目录，异常退出由 TTL sweeper 回收。
+- 每个仓库复用 `plugin-data` 下不含凭证的裸镜像；每次 turn 以 detached commit 创建唯一
+  operation worktree。after-turn 删除工作目录，异常退出由 TTL sweeper 和 worktree prune 回收。
 - Agent 默认只分析，并通过 `github_watch_*` 工具以 GitHub App Bot 身份发布 comment/review。
   只有 owner mention 明确要求修改或创建 PR 时，才允许在临时仓库提交、push 和创建 PR。
 - 从 Issue 创建的修复 PR 必须使用 `Fixes #<issue>` 关联并在合入后自动关闭 Issue；每个 Issue

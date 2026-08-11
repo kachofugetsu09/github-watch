@@ -74,6 +74,7 @@ class CheckoutManager:
                         str(mirror),
                         "worktree",
                         "add",
+                        "--detach",
                         str(repository_dir),
                         f"refs/pull/{event.number}/head",
                     ]
@@ -85,6 +86,7 @@ class CheckoutManager:
                     )
             else:
                 default_branch = self._git_output(mirror, "symbolic-ref", "--short", "HEAD")
+                head_sha = self._git_output(mirror, "rev-parse", default_branch)
                 self._run(
                     [
                         "git",
@@ -92,11 +94,11 @@ class CheckoutManager:
                         str(mirror),
                         "worktree",
                         "add",
+                        "--detach",
                         str(repository_dir),
-                        default_branch,
+                        head_sha,
                     ]
                 )
-                head_sha = self._git_output(repository_dir, "rev-parse", "HEAD")
 
             # 4. Bind commits to the App identity (shared mirror config, idempotent).
             self._run(
@@ -266,6 +268,20 @@ class CheckoutManager:
     def _refresh_mirror(self, mirror: Path, operation_dir: Path) -> None:
         """Incrementally fetch open PR heads and branch refs into the mirror."""
 
+        # 1. Drop administrative records whose operation worktrees no longer exist.
+        self._run(
+            [
+                "git",
+                "-C",
+                str(mirror),
+                "worktree",
+                "prune",
+                "--expire",
+                "now",
+            ]
+        )
+
+        # 2. Refresh refs after no stale worktree can keep a branch checked out.
         self._run_authenticated(
             operation_dir,
             [
