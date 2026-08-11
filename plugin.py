@@ -72,7 +72,7 @@ class GitHubWatchConfig(BaseModel):
 class GitHubWatchPlugin(Plugin):
     api_version = 2
     name = "github-watch"
-    version = "1.2.10"
+    version = "1.2.11"
     desc = "Poll GitHub and wake one stable Akashic thread per issue or PR"
     ConfigModel = GitHubWatchConfig
 
@@ -141,6 +141,22 @@ class GitHubWatchPlugin(Plugin):
 
     def after_turn_modules(self) -> list[object]:
         return [_CheckoutCleanupModule(self)]
+
+    @tool(
+        name="github_watch_runtime_info",
+        risk="read-only",
+        always_on=True,
+    )
+    async def runtime_info(self, event: object) -> dict[str, str]:
+        """Return the active plugin identity and checkout recovery policy."""
+
+        _ = event
+        return {
+            "plugin": self.name,
+            "version": self.version,
+            "checkout_mode": "detached-commit",
+            "mirror_recovery": "worktree-prune-before-fetch",
+        }
 
     @tool(
         name="github_watch_post_comment",

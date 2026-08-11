@@ -14,6 +14,7 @@ Akashic API v2 轮询插件，不使用 webhook。
 - 插件只等 `turn/start` 入队成功，不等待 turn 完成，也不接收或代发最终回复。
 - 每个仓库复用 `plugin-data` 下不含凭证的裸镜像；每次 turn 以 detached commit 创建唯一
   operation worktree。after-turn 删除工作目录，异常退出由 TTL sweeper 和 worktree prune 回收。
+- `github_watch_runtime_info` 只读返回当前插件版本和 checkout 恢复策略，供正式候选验证使用。
 - Agent 默认只分析，并通过 `github_watch_*` 工具以 GitHub App Bot 身份发布 comment/review。
   只有 owner mention 明确要求修改或创建 PR 时，才允许在临时仓库提交、push 和创建 PR。
 - 从 Issue 创建的修复 PR 必须使用 `Fixes #<issue>` 关联并在合入后自动关闭 Issue；每个 Issue
