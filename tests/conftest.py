@@ -3,16 +3,6 @@ from __future__ import annotations
 import importlib.util
 import sys
 from pathlib import Path
-from types import ModuleType
-
-if importlib.util.find_spec("agent") is None:
-    agent = ModuleType("agent")
-    control = ModuleType("agent.control")
-    client = ModuleType("agent.control.client")
-    client.ControlClient = object  # type: ignore[attr-defined]
-    sys.modules.update(
-        {"agent": agent, "agent.control": control, "agent.control.client": client}
-    )
 
 ROOT = Path(__file__).parents[1]
 PACKAGE = "github_watch_test_package"

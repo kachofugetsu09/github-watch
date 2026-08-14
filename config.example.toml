@@ -8,4 +8,3 @@ poll_seconds = 120
 checkout_ttl_seconds = 86400
 notify_channel = "mobile"
 notify_chat_id = "main-chat-id"
-# control_endpoint = "/absolute/path/to/workspace/akashic.sock"

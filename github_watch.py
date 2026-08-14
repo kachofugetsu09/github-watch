@@ -6,10 +6,9 @@ import asyncio
 import json
 import logging
 import re
+from collections.abc import Mapping
 from pathlib import Path
-from typing import Any
-
-from agent.control.client import ControlClient
+from typing import Any, Protocol
 
 from .context_bundle import ContextBundle
 from .checkout import CheckoutManager
@@ -18,6 +17,14 @@ from .ledger import EventLedger, EventState
 from .operations import GitHubOperations
 
 logger = logging.getLogger("plugin.github-watch")
+
+
+class AgentInputPort(Protocol):
+    """提交 GitHub 领域输入，不暴露 Core 控制面。"""
+
+    async def create_session(self, metadata: Mapping[str, object]) -> str: ...
+
+    async def submit(self, session_id: str, content: str) -> str: ...
 
 
 class GitHubWatch:
@@ -30,7 +37,7 @@ class GitHubWatch:
         ledger: EventLedger,
         checkouts: CheckoutManager,
         data_dir: Path,
-        control_endpoint: str,
+        agent_input: AgentInputPort,
         mention: str,
         bot_login: str,
         operations: GitHubOperations | None = None,
@@ -42,7 +49,7 @@ class GitHubWatch:
         self._checkouts = checkouts
         self._operations = operations
         self._context = ContextBundle(client, data_dir)
-        self._control_endpoint = control_endpoint
+        self._agent_input = agent_input
         escaped_mention = re.escape(mention.casefold())
         self._mention_pattern = re.compile(
             rf"(?<![A-Za-z0-9-]){escaped_mention}(?![A-Za-z0-9-])"
@@ -277,44 +284,41 @@ class GitHubWatch:
     ) -> None:
         """Submit one durable turn and return immediately after admission."""
 
-        async with await ControlClient.connect(self._control_endpoint) as client:
-            item = self._ledger.get_item(event.repo, event.kind, event.number)
-            if item is None:
-                raise RuntimeError(f"event item missing: {event.event_key}")
-            thread_id = item.thread_id
-            if thread_id is None:
-                thread = await client.start_thread(
-                    metadata={
-                        "skip_post_memory": True,
-                        "skip_memory_retrieval": True,
-                        "source": "github-watch",
-                        "repo": event.repo,
-                        "item": f"{event.kind}#{event.number}",
-                    }
-                )
-                raw_thread_id = thread.get("id") or thread.get("threadId")
-                if not isinstance(raw_thread_id, str) or not raw_thread_id:
-                    raise RuntimeError(f"thread/start missing id: {thread}")
-                thread_id = raw_thread_id
-                self._ledger.set_thread(event.repo, event.kind, event.number, thread_id)
-            self._ledger.transition(
-                event.event_key,
-                expected=("context_ready",),
-                status="turn_submitting",
-                thread_id=thread_id,
+        # 1. 复用每个 Issue/PR 的稳定 Session，首次创建后先持久化 identity。
+        item = self._ledger.get_item(event.repo, event.kind, event.number)
+        if item is None:
+            raise RuntimeError(f"event item missing: {event.event_key}")
+        session_id = item.thread_id
+        if session_id is None:
+            session_id = await self._agent_input.create_session(
+                {
+                    "skip_post_memory": True,
+                    "skip_memory_retrieval": True,
+                    "source": "github-watch",
+                    "repo": event.repo,
+                    "item": f"{event.kind}#{event.number}",
+                }
             )
-            handle = await client.start_turn(
-                thread_id,
-                self._build_prompt(event, manifest, checkout_path),
-                detached=True,
-            )
-            self._ledger.transition(
-                event.event_key,
-                expected=("turn_submitting",),
-                status="dispatched",
-                turn_id=handle.id,
-            )
-            await self._ack_dispatched(event)
+            self._ledger.set_thread(event.repo, event.kind, event.number, session_id)
+
+        # 2. 写入不确定提交边界，再让 Core 准入一个 detached ordinary Turn。
+        self._ledger.transition(
+            event.event_key,
+            expected=("context_ready",),
+            status="turn_submitting",
+            thread_id=session_id,
+        )
+        turn_id = await self._agent_input.submit(
+            session_id,
+            self._build_prompt(event, manifest, checkout_path),
+        )
+        self._ledger.transition(
+            event.event_key,
+            expected=("turn_submitting",),
+            status="dispatched",
+            turn_id=turn_id,
+        )
+        await self._ack_dispatched(event)
 
     async def _ack_dispatched(self, event: EventState) -> None:
         """React with :eyes: on the item itself once a turn has been admitted."""
