@@ -1,14 +1,69 @@
 from __future__ import annotations
 
 import asyncio
+import ast
 import importlib
 import inspect
 import sys
+import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
 import pytest
+
+
+def _read_static_identity(root: Path) -> tuple[dict[str, object], dict[str, object]]:
+    """Read manifest and literal plugin identity without importing the entrypoint."""
+
+    # 1. Parse only the static manifest and declared source path.
+    manifest = tomllib.loads(
+        (root / "akashic.plugin.toml").read_text(encoding="utf-8")
+    )
+    entrypoint = root / str(manifest["entrypoint"])
+    tree = ast.parse(entrypoint.read_text(encoding="utf-8"), filename=str(entrypoint))
+
+    # 2. Resolve the identity assignments from the entrypoint AST.
+    values: dict[str, object] = {}
+    for node in tree.body:
+        if isinstance(node, ast.Assign):
+            targets = node.targets
+        elif isinstance(node, ast.AnnAssign):
+            targets = (node.target,)
+        else:
+            continue
+        for target in targets:
+            if not isinstance(target, ast.Name):
+                continue
+            if target.id not in {"name", "version", "api_version", "_VERSION"}:
+                continue
+            if isinstance(node.value, ast.Constant):
+                values[target.id] = node.value.value
+            elif isinstance(node.value, ast.Name):
+                values[target.id] = values[node.value.id]
+    return manifest, {
+        "name": values["name"],
+        "version": values["version"],
+        "api_version": values["api_version"],
+    }
+
+
+def test_static_manifest_matches_import_free_entrypoint_identity() -> None:
+    root = Path(__file__).parents[1]
+    manifest, identity = _read_static_identity(root)
+
+    assert manifest == {
+        "schema_version": 1,
+        "name": "github-watch",
+        "version": "3.0.0",
+        "api_version": 3,
+        "entrypoint": "plugin.py",
+    }
+    assert identity == {
+        "name": manifest["name"],
+        "version": manifest["version"],
+        "api_version": manifest["api_version"],
+    }
 
 
 def _load_plugin_module():
