@@ -8,7 +8,6 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from collections.abc import Mapping
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -45,7 +44,7 @@ def main() -> None:
     sys.path.insert(0, str(core))
 
     # 2. Exercise only temporary plugin-data and fake external boundaries.
-    observations = asyncio.run(_exercise(core))
+    observations = asyncio.run(_exercise())
     report = {
         "status": "passed",
         "core_head": expected_core,
@@ -59,18 +58,16 @@ def main() -> None:
     print(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True))
 
 
-async def _exercise(core: Path) -> dict[str, object]:
-    """Load, reload, dispatch, clean up, and fully dispose one real plugin."""
+async def _exercise() -> dict[str, object]:
+    """Load pure-v3 catalogs, publish a candidate, and dispose the activity owner."""
 
     from agent.plugins.composable import ComposablePlugin
+    from agent.plugins.generation_activity_host import ActivityHost
+    from agent.plugins.generation_job_host import BackgroundJobActivityAdapter
     from agent.plugins.manager import PluginManager
-    from agent.plugins.snapshot import bind_runtime_snapshot, reset_runtime_snapshot
     from agent.tools.registry import ToolRegistry
-    from agent.turn_events.after_turn import AFTER_TURN_COMMITTED
     from bus.event_bus import EventBus
-    from bus.events_lifecycle import TurnCommitted
 
-    del core
     with tempfile.TemporaryDirectory(prefix="github-watch-v3-gate-") as raw:
         temp_root = Path(raw)
         plugin_dir = temp_root / "plugins" / "github-watch"
@@ -79,55 +76,64 @@ async def _exercise(core: Path) -> dict[str, object]:
         pem_path = temp_root / "github-app.pem"
         pem_path.write_text("fake", encoding="utf-8")
         _write_config(workspace, pem_path)
-
+        event_bus = EventBus()
         manager = PluginManager(
             plugin_dirs=[temp_root / "plugins"],
-            event_bus=EventBus(),
+            event_bus=event_bus,
             tool_registry=ToolRegistry(),
             workspace=workspace,
             installed_cache_root=temp_root / "plugin-home/cache",
         )
+        jobs = BackgroundJobActivityAdapter(
+            event_bus,
+            manager.snapshot_store,
+            workspace=str(workspace),
+            interval_poll_seconds=60,
+        )
+        manager.bind_activity_host(ActivityHost((jobs,)))
         created: list[tuple[str, dict[str, object]]] = []
-        submitted: list[tuple[str, str, str]] = []
-
-        async def create_session(
-            plugin_id: str,
-            metadata: Mapping[str, object],
-        ) -> str:
-            created.append((plugin_id, dict(metadata)))
-            return "session-1"
-
-        async def submit(
-            plugin_id: str,
-            session_id: str,
-            content: str,
-            metadata: Mapping[str, object],
-        ) -> str:
-            del metadata
-            submitted.append((plugin_id, session_id, content))
-            return "turn-1"
-
-        manager.bind_agent_input(create_session=create_session, submit=submit)
-        callback_release = asyncio.Event()
-        callback_started = asyncio.Event()
-        callback_finished = asyncio.Event()
-        lease_release = asyncio.Event()
-        cleanup_operations: list[str] = []
+        sessions: dict[str, dict[str, object]] = {}
         runtime_data_paths: list[Path] = []
         fake_watch_count = 0
+
+        class FakeConversationRuntime:
+            async def start_turn(self, _request: object, **_kwargs: object) -> object:
+                return SimpleNamespace(
+                    id="turn-1",
+                    result=lambda: asyncio.sleep(0),
+                )
+
+        async def create_session(
+            *,
+            key: str,
+            metadata: dict[str, object],
+        ) -> None:
+            created.append((key, dict(metadata)))
+            sessions[key] = dict(metadata)
+
+        async def read_session(key: str) -> dict[str, object] | None:
+            metadata = sessions.get(key)
+            if metadata is None:
+                return None
+            return {"key": key, "metadata": dict(metadata)}
+
+        jobs.bind_conversation_runtime(
+            FakeConversationRuntime(),
+            programmatic_session_creator=create_session,
+            programmatic_session_reader=read_session,
+        )
 
         try:
             await manager.load_all()
             generation = manager.generation("github-watch")
-            old_snapshot = manager.current_snapshot
+            snapshot = manager.current_snapshot
             if (
                 generation is None
-                or old_snapshot is None
-                or old_snapshot.composition_root is None
+                or snapshot is None
+                or snapshot.composition_root is None
                 or not isinstance(generation.instance, ComposablePlugin)
             ):
                 raise RuntimeError("GitHub Watch v3 generation did not load")
-            old_root = old_snapshot.composition_root
             module = generation.instance.module
 
             class FakeLedger:
@@ -140,15 +146,6 @@ async def _exercise(core: Path) -> dict[str, object]:
                 def recover_interrupted(self) -> dict[str, int]:
                     return {}
 
-                def get_event_by_turn(self, turn_id: str) -> object | None:
-                    if turn_id != "turn-1":
-                        return None
-                    return SimpleNamespace(
-                        operation_id="a" * 32,
-                        event_key="owner/repo:issue:1:opened",
-                        thread_id="session-1",
-                    )
-
             class FakeCheckouts:
                 def __init__(self, *_args: object, **_kwargs: object) -> None:
                     pass
@@ -156,25 +153,33 @@ async def _exercise(core: Path) -> dict[str, object]:
                 def sweep(self) -> int:
                     return 0
 
-                def cleanup(self, operation_id: str) -> bool:
-                    cleanup_operations.append(operation_id)
-                    return True
-
             class FakeWatch:
-                def __init__(self, **kwargs: object) -> None:
+                def __init__(self, **_kwargs: object) -> None:
                     nonlocal fake_watch_count
                     fake_watch_count += 1
-                    self._agent_input = cast(Any, kwargs["agent_input"])
 
-                async def poll(self, repositories: list[str]) -> None:
-                    if repositories != ["owner/repo"]:
-                        raise AssertionError(repositories)
-                    callback_started.set()
-                    await callback_release.wait()
-                    session_id = await self._agent_input.create_session(
-                        {"source": "github-watch"}
-                    )
-                    _ = await self._agent_input.submit(session_id, "gate prompt")
+                async def poll(self, _repositories: list[str], turns: Any) -> None:
+                    session_id = await turns.create_session(metadata={"source": "gate"})
+                    _ = await turns.submit(session_id, "inspect gate event")
+
+            async def run_formal_job(bucket: str) -> None:
+                binding = jobs.active_binding
+                if binding is None or len(binding.jobs) != 1:
+                    raise RuntimeError("GitHub Watch formal job binding is unavailable")
+                await jobs.enqueue_interval(
+                    binding,
+                    next(iter(binding.jobs)),
+                    interval_bucket=bucket,
+                )
+                for _ in range(200):
+                    if (
+                        not binding.pending_admission
+                        and not binding.queued
+                        and not binding.running
+                    ):
+                        return
+                    await asyncio.sleep(0.01)
+                raise RuntimeError("GitHub Watch formal job did not settle")
 
             setattr(module, "EventLedger", FakeLedger)
             setattr(module, "GitHubClient", lambda **_kwargs: object())
@@ -182,29 +187,16 @@ async def _exercise(core: Path) -> dict[str, object]:
             setattr(module, "GitHubOperations", lambda *_args: object())
             setattr(module, "GitHubWatch", FakeWatch)
 
-            timer = old_snapshot.timers["github-watch:poll"]
+            # 3. Run the committed handler through the real ActivityHost and Turn port.
+            await run_formal_job("gate-initial")
+            if len(created) != 1:
+                raise RuntimeError("programmatic Session was not created exactly once")
 
-            async def invoke_old_timer() -> None:
-                lease = manager.snapshot_store.lease()
-                if not lease.stable_at_claim:
-                    raise RuntimeError("old Timer did not claim stable")
-                token = bind_runtime_snapshot(lease)
-                try:
-                    await timer.invoke()
-                    callback_finished.set()
-                    await lease_release.wait()
-                finally:
-                    reset_runtime_snapshot(token)
-                    await lease.release()
-
-            callback_task = asyncio.create_task(invoke_old_timer())
-            await asyncio.wait_for(callback_started.wait(), timeout=2)
-
-            # 3. Publish a new generation while the old stable callback is leased.
+            # 4. Publish a candidate and prove its Root emits no external effect.
             plugin_path = plugin_dir / "plugin.py"
             source = plugin_path.read_text(encoding="utf-8")
             plugin_path.write_text(
-                source.replace('_VERSION = "2.0.0"', '_VERSION = "2.0.1"'),
+                source.replace('_VERSION = "3.0.0"', '_VERSION = "3.0.1"'),
                 encoding="utf-8",
             )
             candidate = await manager.prepare_candidate("github-watch")
@@ -216,44 +208,38 @@ async def _exercise(core: Path) -> dict[str, object]:
             publication = await manager.publish_prepared("github-watch")
             if publication["publication_state"] != "committed":
                 raise RuntimeError(f"candidate did not commit: {publication}")
-            if old_snapshot.state != "retired":
-                raise RuntimeError("old snapshot did not retire")
 
-            # 4. The old task completes Agent Input, then its async listener cleans up.
-            callback_release.set()
-            await asyncio.wait_for(callback_finished.wait(), timeout=2)
-            committed = TurnCommitted(
-                session_key="session-1",
-                channel="test",
-                chat_id="chat",
-                input_message="gate prompt",
-                persisted_user_message="gate prompt",
-                assistant_response="done",
-                tools_used=[],
-                turn_id="turn-1",
-            )
-            result = await old_root.context.serial(AFTER_TURN_COMMITTED, committed)
-            if result is not None:
-                raise RuntimeError("TurnCommitted listener returned Bail")
-            lease_release.set()
-            await asyncio.wait_for(callback_task, timeout=2)
-            await manager.snapshot_store.retry_drains()
+            # 5. Prove the rebuilt formal module owns a fresh exact job binding.
+            promoted = manager.generation("github-watch")
+            if promoted is None or not isinstance(promoted.instance, ComposablePlugin):
+                raise RuntimeError("published GitHub Watch generation is unavailable")
+            promoted_module = promoted.instance.module
+            setattr(promoted_module, "EventLedger", FakeLedger)
+            setattr(promoted_module, "GitHubClient", lambda **_kwargs: object())
+            setattr(promoted_module, "CheckoutManager", FakeCheckouts)
+            setattr(promoted_module, "GitHubOperations", lambda *_args: object())
+            setattr(promoted_module, "GitHubWatch", FakeWatch)
+            await run_formal_job("gate-promoted")
+            if len(created) != 2:
+                raise RuntimeError("promoted formal job did not admit a second Turn")
 
             current = manager.current_snapshot
             if current is None or current.tool_registry is None:
                 raise RuntimeError("published snapshot has no ToolRegistry")
             tool_names = current.tool_registry.get_registered_order()
             expected_tools = [
-                "github_watch_runtime_info",
-                "github_watch_post_comment",
-                "github_watch_submit_review",
-                "github_watch_push_branch",
                 "github_watch_create_pr",
+                "github_watch_post_comment",
+                "github_watch_push_branch",
+                "github_watch_runtime_info",
+                "github_watch_submit_review",
             ]
             if tool_names != expected_tools:
                 raise RuntimeError(f"Tool catalog mismatch: {tool_names}")
-            if old_root.receipt().effects:
-                raise RuntimeError("retired Root retained effects")
+            job_catalog = current.background_job_catalog
+            if job_catalog is None or [descriptor.name for descriptor in job_catalog.descriptors] != ["poll"]:
+                raise RuntimeError("background job catalog mismatch")
+            await manager.snapshot_store.retry_drains()
             return {
                 "services": list(current.composition_topology.services)
                 if current.composition_topology is not None
@@ -261,21 +247,14 @@ async def _exercise(core: Path) -> dict[str, object]:
                 "listeners": list(current.composition_topology.listeners)
                 if current.composition_topology is not None
                 else [],
-                "timers": sorted(current.timers),
+                "background_jobs": [descriptor.name for descriptor in job_catalog.descriptors],
                 "tools": tool_names,
-                "agent_input_created": created,
-                "agent_input_submitted": [
-                    (plugin_id, session_id, content)
-                    for plugin_id, session_id, content in submitted
-                ],
+                "candidate_external_effects": list(candidate_root.receipt().external_effects),
                 "runtime_data_paths": [str(path.relative_to(temp_root)) for path in runtime_data_paths],
                 "fake_watch_count": fake_watch_count,
-                "cleanup_operations": cleanup_operations,
-                "old_root_effects_after_drain": list(old_root.receipt().effects),
+                "programmatic_sessions": created,
             }
         finally:
-            callback_release.set()
-            lease_release.set()
             await manager.terminate_all()
 
 

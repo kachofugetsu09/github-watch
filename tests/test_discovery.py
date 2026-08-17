@@ -33,6 +33,10 @@ class FakeCheckouts:
         return []
 
 
+class FakeTurns:
+    pass
+
+
 def item(number: int, updated_at: str) -> dict[str, Any]:
     return {"number": number, "updated_at": updated_at}
 
@@ -48,7 +52,6 @@ def build_watch(tmp_path: Path, fake: FakeGitHub) -> tuple[GitHubWatch, EventLed
         ledger=ledger,
         checkouts=FakeCheckouts(),  # type: ignore[arg-type]
         data_dir=tmp_path,
-        agent_input=object(),  # type: ignore[arg-type]
         mention="@akashic-review-bot",
         bot_login="akashic-review-bot[bot]",
     )
@@ -73,7 +76,7 @@ def test_poll_contains_exhausted_transport_failure(
     fake.repository = unavailable  # type: ignore[method-assign]
     watch, _ = build_watch(tmp_path, fake)
 
-    asyncio.run(watch.poll(["owner/repo"]))
+    asyncio.run(watch.poll(["owner/repo"], FakeTurns()))  # type: ignore[arg-type]
 
     assert "GET retries exhausted" in caplog.text
 

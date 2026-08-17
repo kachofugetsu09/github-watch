@@ -2,10 +2,33 @@ from __future__ import annotations
 
 import importlib.util
 import sys
+from types import ModuleType
 from pathlib import Path
 
 ROOT = Path(__file__).parents[1]
 PACKAGE = "github_watch_test_package"
+
+# The domain unit tests load the plugin package without a full Core checkout.
+# Keep the exact Core admission error identities available at that boundary.
+if "agent.plugin_composition" not in sys.modules:
+    agent = ModuleType("agent")
+    composition = ModuleType("agent.plugin_composition")
+
+    class ProgrammaticTurnPreAdmissionError(RuntimeError):
+        pass
+
+    class ProgrammaticTurnUncertainError(RuntimeError):
+        pass
+
+    composition.ProgrammaticTurnPreAdmissionError = ProgrammaticTurnPreAdmissionError  # type: ignore[attr-defined]
+    composition.ProgrammaticTurnUncertainError = ProgrammaticTurnUncertainError  # type: ignore[attr-defined]
+    sys.modules.update(
+        {
+            "agent": agent,
+            "agent.plugin_composition": composition,
+        }
+    )
+
 spec = importlib.util.spec_from_file_location(
     PACKAGE,
     ROOT / "__init__.py",

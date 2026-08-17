@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import inspect
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
@@ -12,8 +14,6 @@ import pytest
 def _load_plugin_module():
     agent = ModuleType("agent")
     composition = ModuleType("agent.plugin_composition")
-    tools = ModuleType("agent.tools")
-    tools_base = ModuleType("agent.tools.base")
     turn_events = ModuleType("agent.turn_events")
     after_turn = ModuleType("agent.turn_events.after_turn")
     bus = ModuleType("bus")
@@ -22,33 +22,51 @@ def _load_plugin_module():
     class Context:
         pass
 
-    class AgentInputService:
+    class ProgrammaticTurnPreAdmissionError(RuntimeError):
         pass
 
-    class Tool:
+    class ProgrammaticTurnUncertainError(RuntimeError):
         pass
+
+    @dataclass(frozen=True)
+    class IntervalTrigger:
+        seconds: int
+
+    @dataclass(frozen=True)
+    class BackgroundJobDefinition:
+        name: str
+        triggers: tuple[object, ...]
+        handler_export: str
+        programmatic_turns: bool = False
+
+    @dataclass(frozen=True)
+    class PluginToolDefinition:
+        name: str
+        description: str
+        parameters: dict[str, object]
+        handler_export: str
+        risk: str
+        always_on: bool
 
     class TurnCommitted:
         def __init__(self, session_key: str, turn_id: str) -> None:
             self.session_key = session_key
             self.turn_id = turn_id
 
-    composition.AGENT_INPUT = object()  # type: ignore[attr-defined]
-    composition.PLUGIN_TOOLS = object()  # type: ignore[attr-defined]
-    composition.TIMER_SERVICE = object()  # type: ignore[attr-defined]
-    composition.AgentInputService = AgentInputService  # type: ignore[attr-defined]
+    composition.BACKGROUND_JOBS = object()  # type: ignore[attr-defined]
+    composition.TOOL_CATALOG = object()  # type: ignore[attr-defined]
+    composition.BackgroundJobDefinition = BackgroundJobDefinition  # type: ignore[attr-defined]
     composition.Context = Context  # type: ignore[attr-defined]
-    composition.ToolRisk = str  # type: ignore[attr-defined]
-    tools_base.Tool = Tool  # type: ignore[attr-defined]
-    tools_base.get_current_tool_context = lambda: None  # type: ignore[attr-defined]
+    composition.IntervalTrigger = IntervalTrigger  # type: ignore[attr-defined]
+    composition.PluginToolDefinition = PluginToolDefinition  # type: ignore[attr-defined]
+    composition.ProgrammaticTurnPreAdmissionError = ProgrammaticTurnPreAdmissionError  # type: ignore[attr-defined]
+    composition.ProgrammaticTurnUncertainError = ProgrammaticTurnUncertainError  # type: ignore[attr-defined]
     after_turn.AFTER_TURN_COMMITTED = object()  # type: ignore[attr-defined]
     events_lifecycle.TurnCommitted = TurnCommitted  # type: ignore[attr-defined]
     sys.modules.update(
         {
             "agent": agent,
             "agent.plugin_composition": composition,
-            "agent.tools": tools,
-            "agent.tools.base": tools_base,
             "agent.turn_events": turn_events,
             "agent.turn_events.after_turn": after_turn,
             "bus": bus,
@@ -59,62 +77,37 @@ def _load_plugin_module():
     return importlib.import_module("github_watch_test_package.plugin")
 
 
-class _FakeAgentInput:
-    async def create_session(self, _ctx, *, metadata):
-        del metadata
-        return SimpleNamespace(id="session-1")
-
-    async def submit(self, _ctx, session_id: str, content: str):
-        del content
-        return SimpleNamespace(session_id=session_id, turn_id="turn-1")
-
-
-class _FakeTools:
+class _FakeJobs:
     def __init__(self) -> None:
-        self.registrations: list[tuple[object, str, bool]] = []
+        self.registrations: list[object] = []
 
-    async def register(
-        self,
-        _ctx,
-        tool: object,
-        *,
-        risk: str,
-        always_on: bool,
-    ) -> None:
-        self.registrations.append((tool, risk, always_on))
+    async def register(self, _ctx: object, definition: object) -> None:
+        self.registrations.append(definition)
 
 
-class _FakeTimer:
+class _FakeCatalog:
     def __init__(self) -> None:
-        self.intervals: list[tuple[object, float, str]] = []
+        self.registrations: list[object] = []
 
-    async def interval(
-        self,
-        _ctx,
-        callback: object,
-        delay: float,
-        *,
-        name: str,
-    ) -> None:
-        self.intervals.append((callback, delay, name))
+    async def register(self, _ctx: object, definition: object) -> None:
+        self.registrations.append(definition)
 
 
 class _FakeContext:
-    def __init__(self, module, data_dir: Path) -> None:
+    def __init__(self, module: ModuleType, data_dir: Path) -> None:
+        self.data_root = data_dir
         self.runtime = SimpleNamespace(
             plugin_id="github-watch",
             plugin_dir=data_dir.parent,
             data_dir=data_dir,
             workspace=data_dir.parent,
         )
-        self.agent_input = _FakeAgentInput()
-        self.tools = _FakeTools()
-        self.timer = _FakeTimer()
+        self.jobs = _FakeJobs()
+        self.catalog = _FakeCatalog()
         self.listeners: list[tuple[object, object]] = []
         self._services = {
-            module.AGENT_INPUT: self.agent_input,
-            module.PLUGIN_TOOLS: self.tools,
-            module.TIMER_SERVICE: self.timer,
+            module.BACKGROUND_JOBS: self.jobs,
+            module.TOOL_CATALOG: self.catalog,
         }
 
     def require(self, key: object) -> object:
@@ -124,23 +117,71 @@ class _FakeContext:
         self.listeners.append((key, listener))
 
 
-def test_v3_apply_rebuilds_production_runtime_without_touching_candidate_data(
+class _FakeTurns:
+    pass
+
+
+def test_v3_apply_registers_candidate_inert_descriptors_without_pem_or_data(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
     plugin_module = _load_plugin_module()
-    pem_path = tmp_path / "github-app.pem"
-    pem_path.write_text("test")
-    candidate_dir = tmp_path / "candidate"
-    production_dir = tmp_path / "production"
     config = plugin_module.GitHubWatchConfig(
         app_id=1,
         installation_id=2,
-        pem_path=str(pem_path),
+        pem_path=str(tmp_path / "missing.pem"),
         repositories=["owner/repo"],
     )
+    candidate = _FakeContext(plugin_module, tmp_path / "candidate")
+    formal = _FakeContext(plugin_module, tmp_path / "formal")
+
+    asyncio.run(plugin_module.apply(candidate, config))
+
+    assert candidate.data_root.exists() is False
+    assert len(candidate.jobs.registrations) == 1
+    job = candidate.jobs.registrations[0]
+    assert job.programmatic_turns is True
+    assert job.handler_export == "run_github_watch_poll"
+    assert len(candidate.catalog.registrations) == 5
+    assert [definition.name for definition in candidate.catalog.registrations] == [
+        "github_watch_runtime_info",
+        "github_watch_post_comment",
+        "github_watch_submit_review",
+        "github_watch_push_branch",
+        "github_watch_create_pr",
+    ]
+    assert all(definition.always_on for definition in candidate.catalog.registrations)
+    assert candidate.listeners[0][0] is plugin_module.AFTER_TURN_COMMITTED
+    assert inspect.iscoroutinefunction(candidate.listeners[0][1]) is False
+
+    async def unexpected_client(**_kwargs: object) -> object:
+        raise AssertionError("candidate must not construct a GitHub client")
+
+    monkeypatch.setattr(plugin_module, "GitHubClient", unexpected_client)
+    with pytest.raises(RuntimeError, match="candidate GitHub Watch job"):
+        asyncio.run(plugin_module.run_github_watch_poll(SimpleNamespace(turns=None)))
+    assert candidate.data_root.exists() is False
+
+    asyncio.run(plugin_module.apply(formal, config))
+    formal_job = formal.jobs.registrations[0]
+    assert formal_job.programmatic_turns is True
+
+
+def test_formal_job_lazily_builds_runtime_and_passes_invocation_turn_port(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    plugin_module = _load_plugin_module()
+    config = plugin_module.GitHubWatchConfig(
+        app_id=1,
+        installation_id=2,
+        pem_path=str(tmp_path / "missing.pem"),
+        repositories=["owner/repo"],
+    )
+    context = _FakeContext(plugin_module, tmp_path / "formal")
+    asyncio.run(plugin_module.apply(context, config))
     ledger_paths: list[Path] = []
-    poll_calls: list[list[str]] = []
+    poll_calls: list[tuple[list[str], object]] = []
 
     class FakeLedger:
         def __init__(self, path: Path) -> None:
@@ -160,8 +201,8 @@ def test_v3_apply_rebuilds_production_runtime_without_touching_candidate_data(
             return 0
 
     class FakeWatch:
-        async def poll(self, repositories: list[str]) -> None:
-            poll_calls.append(list(repositories))
+        async def poll(self, repositories: list[str], turns: object) -> None:
+            poll_calls.append((list(repositories), turns))
 
     monkeypatch.setattr(plugin_module, "EventLedger", FakeLedger)
     monkeypatch.setattr(plugin_module, "GitHubClient", lambda **_kwargs: object())
@@ -169,55 +210,35 @@ def test_v3_apply_rebuilds_production_runtime_without_touching_candidate_data(
     monkeypatch.setattr(plugin_module, "GitHubOperations", lambda *_args: object())
     monkeypatch.setattr(plugin_module, "GitHubWatch", lambda **_kwargs: FakeWatch())
 
-    candidate = _FakeContext(plugin_module, candidate_dir)
-    production = _FakeContext(plugin_module, production_dir)
-    asyncio.run(plugin_module.apply(candidate, config))
-    asyncio.run(plugin_module.apply(production, config))
+    turns = _FakeTurns()
+    asyncio.run(plugin_module.run_github_watch_poll(SimpleNamespace(turns=turns)))
 
-    assert ledger_paths == []
-    assert candidate_dir.exists() is False
-    assert [tool.name for tool, _, _ in production.tools.registrations] == [
-        "github_watch_runtime_info",
-        "github_watch_post_comment",
-        "github_watch_submit_review",
-        "github_watch_push_branch",
-        "github_watch_create_pr",
-    ]
-    assert [risk for _, risk, _ in production.tools.registrations] == [
-        "read-only",
-        "external-side-effect",
-        "external-side-effect",
-        "external-side-effect",
-        "external-side-effect",
-    ]
-    assert all(always_on for _, _, always_on in production.tools.registrations)
-    assert production.listeners[0][0] is plugin_module.AFTER_TURN_COMMITTED
-    assert len(production.timer.intervals) == 1
-    callback, delay, timer_name = production.timer.intervals[0]
-    assert (delay, timer_name) == (120, "poll")
-
-    asyncio.run(callback())
-
-    assert ledger_paths == [production_dir / "events.sqlite3"]
-    assert poll_calls == [["owner/repo"]]
+    assert ledger_paths == [context.data_root / "events.sqlite3"]
+    assert poll_calls == [(["owner/repo"], turns)]
 
 
-def test_composition_agent_input_preserves_core_identities() -> None:
+def test_v3_handlers_have_exact_core_signatures() -> None:
     plugin_module = _load_plugin_module()
-    ctx = object()
-    service = _FakeAgentInput()
-    adapter = plugin_module._CompositionAgentInput(ctx, service)
+    job_signature = inspect.signature(plugin_module.run_github_watch_poll)
+    assert tuple(job_signature.parameters) == ("context",)
+    assert inspect.iscoroutinefunction(plugin_module.run_github_watch_poll)
+    for name in (
+        "run_github_watch_runtime_info",
+        "run_github_watch_post_comment",
+        "run_github_watch_submit_review",
+        "run_github_watch_push_branch",
+        "run_github_watch_create_pr",
+    ):
+        handler = getattr(plugin_module, name)
+        assert tuple(inspect.signature(handler).parameters) == (
+            "context",
+            "arguments",
+        )
+        assert inspect.iscoroutinefunction(handler)
 
-    session_id = asyncio.run(adapter.create_session({"source": "github-watch"}))
-    turn_id = asyncio.run(adapter.submit(session_id, "prompt"))
 
-    assert session_id == "session-1"
-    assert turn_id == "turn-1"
-
-
-def test_tool_authorization_binds_operation_to_core_origin_session(
+def test_tool_authorization_binds_operation_to_explicit_origin_session(
     tmp_path: Path,
-    monkeypatch,
 ) -> None:
     plugin_module = _load_plugin_module()
     event = SimpleNamespace(
@@ -233,52 +254,43 @@ def test_tool_authorization_binds_operation_to_core_origin_session(
             assert operation_id == "a" * 32
             return event
 
-    config = plugin_module.GitHubWatchConfig(
-        app_id=1,
-        installation_id=2,
-        pem_path=str(tmp_path / "unused.pem"),
-        repositories=["owner/repo"],
-    )
-    runtime = plugin_module.GitHubWatchRuntime(
-        config=config,
-        data_dir=tmp_path,
-        agent_input=object(),
-    )
-    runtime._bound = plugin_module._BoundRuntime(
+    plugin_module._bound = plugin_module._BoundRuntime(
         ledger=FakeLedger(),
         checkouts=object(),
         operations=object(),
         watch=object(),
     )
-    monkeypatch.setattr(
-        plugin_module,
-        "get_current_tool_context",
-        lambda: SimpleNamespace(origin_session_key="session-1"),
-    )
+    context = SimpleNamespace(origin_session_key="session-1")
 
-    assert runtime._authorized_event("a" * 32) is event
+    assert plugin_module._authorized_event(context, "a" * 32) is event
 
-    monkeypatch.setattr(
-        plugin_module,
-        "get_current_tool_context",
-        lambda: SimpleNamespace(origin_session_key="session-other"),
-    )
     with pytest.raises(PermissionError, match="current dispatched session"):
-        runtime._authorized_event("a" * 32)
+        plugin_module._authorized_event(
+            SimpleNamespace(origin_session_key="session-other"),
+            "a" * 32,
+        )
 
 
-def test_v3_entrypoint_does_not_import_legacy_plugin_categories() -> None:
+def test_v3_entrypoint_has_no_legacy_runtime_categories() -> None:
     root = Path(__file__).parents[1]
     source = (root / "plugin.py").read_text(encoding="utf-8")
     coordinator = (root / "github_watch.py").read_text(encoding="utf-8")
 
     for legacy_name in (
+        "AGENT_INPUT",
+        "PLUGIN_TOOLS",
+        "TIMER_SERVICE",
+        "AgentInputService",
         "PluginJobSpec",
         "PluginJobContext",
-        "IntervalTrigger",
         "ControlClient",
         "after_turn_modules",
-        "@tool",
+        "get_current_tool_context",
+        "TurnAdmissionPreconditionFailure",
+        "TurnAdmissionUncertain",
+        "class Tool",
+        "_CompositionAgentInput",
+        "GitHubWatchRuntime",
     ):
         assert legacy_name not in source
         assert legacy_name not in coordinator

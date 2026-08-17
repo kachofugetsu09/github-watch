@@ -33,11 +33,11 @@
 └──────────┬───────────┘
            ▼
 ┌──────────────────────┐
-│ Stable Agent Session │  fresh turn per allowed event
+│ Stable Agent Session │  fresh programmatic Turn per allowed event
 └──────────┬───────────┘
            ▼
 ┌──────────────────────┐
-│ Fire-and-forget turn │  return after Agent Input admission
+│ Fire-and-forget turn │  return after programmatic Turn admission
 └──────────┬───────────┘
            ▼
 ┌──────────────────────┐
@@ -72,7 +72,7 @@ discovered → claimed → context_ready → turn_submitting → dispatched
 
 - `claimed/context_ready` 在重启后可安全回到 `discovered`，因为 turn 尚未提交。
 - `turn_submitting` 中断后转为 `manual_reconcile`，不自动重试。
-- Agent Input 返回 Turn identity 后立即进入终态 `dispatched`；插件不等待 Turn 完成。
+- programmatic Turn 返回 identity 后立即进入终态 `dispatched`；插件不等待 Turn 完成。
 - Agent 自行发送 comment，发送前检查稳定 operation marker，已有则不重复发送。
 - 带 operation marker 的 comment 永不触发 owner mention，避免 owner 凭证发送时形成自激循环。
 
@@ -102,27 +102,27 @@ GET 和短命 installation token 交换遇到短暂 TLS、连接或不完整响�
 ## v3 组合所有权
 
 ```text
-┌──────────────────┐  core.timer       ┌────────────────────┐
+┌──────────────────┐  core.background_jobs ┌────────────────────┐
 │ GitHub Watch     │ ◀──────────────── │ stable snapshot    │
 │ polling + ledger │                   │ cadence + coalesce │
 └────────┬─────────┘                   └────────────────────┘
-         │ AgentInputPort
+         │ BackgroundJobContext.turns
          ▼
-┌──────────────────┐  core.agent_input ┌────────────────────┐
-│ domain dispatch  │ ────────────────▶ │ Session/Turn owner │
+┌──────────────────┐  core.background_jobs ┌────────────────────┐
+│ domain dispatch  │ ───────────────────▶ │ Session/Turn owner │
 └────────┬─────────┘                   └────────────────────┘
-         │ plugin-owned Tool impl + typed TurnCommitted listener
+         │ TOOL_CATALOG descriptors + typed TurnCommitted listener
          ▼
-┌──────────────────┐                   ┌────────────────────┐
-│ GitHub/checkout  │                   │ core.tools/events  │
-│ SQLite/evidence  │                   │ registry + timing  │
-└──────────────────┘                   └────────────────────┘
+┌──────────────────┐                   ┌────────────────────────┐
+│ GitHub/checkout  │                   │ core.tool_catalog/events│
+│ SQLite/evidence  │                   │ registry + timing      │
+└──────────────────┘                   └────────────────────────┘
 ```
 
-Core 不暴露 ControlClient、PluginManager、SessionManager 或 JobService。插件自有
-`AgentInputPort` 只接受创建 Session 与提交普通输入，`plugin.py` 的薄适配器把它接到 Core
-Service。Tool 的 operation/thread 绑定仍由 SQLite event identity 与 Core 提供的不可变 Tool
-execution context 双重确定，不再重复读取可变 Session metadata。
+插件不取得 Core control plane、Session store 或 job host。`BackgroundJobContext.turns` 只接受
+创建 invocation-scoped Session 与提交普通输入；Core 负责生成不可伪造的 Session/Turn receipt。
+Tool 的 operation/thread 绑定仍由 SQLite event identity 与 Core 提供的不可变 Tool execution
+context 双重确定，不再重复读取可变 Session metadata。
 
 参考：
 
