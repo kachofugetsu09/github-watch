@@ -35,7 +35,7 @@ def _read_static_identity(root: Path) -> tuple[dict[str, object], dict[str, obje
         for target in targets:
             if not isinstance(target, ast.Name):
                 continue
-            if target.id not in {"name", "version", "api_version", "_VERSION"}:
+            if target.id not in {"name", "version", "api_version"}:
                 continue
             if isinstance(node.value, ast.Constant):
                 values[target.id] = node.value.value

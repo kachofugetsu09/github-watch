@@ -34,7 +34,6 @@ from .operations import GitHubOperations
 
 logger = logging.getLogger("plugin.github-watch")
 _REPOSITORY = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
-_VERSION = "3.0.0"
 
 
 class GitHubWatchConfig(BaseModel):
@@ -384,7 +383,7 @@ def _tool_definitions() -> tuple[PluginToolDefinition, ...]:
 
 api_version = 3
 name = "github-watch"
-version = _VERSION
+version = "3.0.0"
 desc = "Poll GitHub and wake one stable Akashic Session per issue or PR"
 Config = GitHubWatchConfig
 inject = (BACKGROUND_JOBS, TOOL_CATALOG)
