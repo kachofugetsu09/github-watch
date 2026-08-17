@@ -162,13 +162,31 @@ async def _exercise() -> dict[str, object]:
                     session_id = await turns.create_session(metadata={"source": "gate"})
                     _ = await turns.submit(session_id, "inspect gate event")
 
-            async def run_formal_job(bucket: str) -> None:
+            async def run_formal_job(
+                bucket: str,
+                *,
+                expected_snapshot_id: str,
+                expected_generation_id: str,
+                expected_module: object,
+            ) -> None:
                 binding = jobs.active_binding
                 if binding is None or len(binding.jobs) != 1:
                     raise RuntimeError("GitHub Watch formal job binding is unavailable")
+                if binding.snapshot_id != expected_snapshot_id:
+                    raise RuntimeError("GitHub Watch job binding is not exact snapshot")
+                job = next(iter(binding.jobs.values()))
+                if job.binding.generation_id != expected_generation_id:
+                    raise RuntimeError("GitHub Watch job binding is not exact generation")
+                expected_handler = getattr(
+                    expected_module,
+                    job.binding.handler_export,
+                    None,
+                )
+                if job.handler is not expected_handler:
+                    raise RuntimeError("GitHub Watch job handler is not exact module export")
                 await jobs.enqueue_interval(
                     binding,
-                    next(iter(binding.jobs)),
+                    job.key,
                     interval_bucket=bucket,
                 )
                 for _ in range(200):
@@ -188,9 +206,16 @@ async def _exercise() -> dict[str, object]:
             setattr(module, "GitHubWatch", FakeWatch)
 
             # 3. Run the committed handler through the real ActivityHost and Turn port.
-            await run_formal_job("gate-initial")
+            await run_formal_job(
+                "gate-initial",
+                expected_snapshot_id=snapshot.snapshot_id,
+                expected_generation_id=generation.generation_id,
+                expected_module=module,
+            )
             if len(created) != 1:
                 raise RuntimeError("programmatic Session was not created exactly once")
+            if fake_watch_count != 1 or len(runtime_data_paths) != 1:
+                raise RuntimeError("initial formal runtime ownership mismatch")
 
             # 4. Publish a candidate and prove its Root emits no external effect.
             plugin_path = plugin_dir / "plugin.py"
@@ -205,6 +230,12 @@ async def _exercise() -> dict[str, object]:
             candidate_root = candidate.runtime_snapshot.composition_root
             if candidate_root is None or candidate_root.receipt().external_effects:
                 raise RuntimeError("candidate emitted an external effect")
+            if (
+                fake_watch_count != 1
+                or len(runtime_data_paths) != 1
+                or len(created) != 1
+            ):
+                raise RuntimeError("candidate executed formal job or opened formal data")
             publication = await manager.publish_prepared("github-watch")
             if publication["publication_state"] != "committed":
                 raise RuntimeError(f"candidate did not commit: {publication}")
@@ -219,8 +250,16 @@ async def _exercise() -> dict[str, object]:
             setattr(promoted_module, "CheckoutManager", FakeCheckouts)
             setattr(promoted_module, "GitHubOperations", lambda *_args: object())
             setattr(promoted_module, "GitHubWatch", FakeWatch)
-            await run_formal_job("gate-promoted")
-            if len(created) != 2:
+            current_after_promotion = manager.current_snapshot
+            if current_after_promotion is None:
+                raise RuntimeError("promoted snapshot is unavailable")
+            await run_formal_job(
+                "gate-promoted",
+                expected_snapshot_id=current_after_promotion.snapshot_id,
+                expected_generation_id=promoted.generation_id,
+                expected_module=promoted_module,
+            )
+            if len(created) != 2 or fake_watch_count != 2:
                 raise RuntimeError("promoted formal job did not admit a second Turn")
 
             current = manager.current_snapshot
