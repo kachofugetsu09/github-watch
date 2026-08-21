@@ -63,6 +63,9 @@ class CheckoutManager:
             # 2. Persist one full mirror per repository; refresh incrementally.
             mirror = self._ensure_mirror(event.repo, operation_dir)
             self._refresh_mirror(mirror, operation_dir)
+            self._run(
+                ["git", "-C", str(mirror), "config", "core.symlinks", "false"]
+            )
 
             # 3. Create a local worktree at the PR head or the default branch.
             if event.kind == "pr":
