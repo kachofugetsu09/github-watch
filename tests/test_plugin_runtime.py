@@ -58,6 +58,7 @@ def test_static_manifest_matches_import_free_entrypoint_identity() -> None:
         "version": "3.0.0",
         "api_version": 3,
         "entrypoint": "plugin.py",
+        "validation": {"exclude_data_paths": ["checkouts", "mirror"]},
     }
     assert identity == {
         "name": manifest["name"],
