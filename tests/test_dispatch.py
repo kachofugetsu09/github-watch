@@ -325,6 +325,56 @@ def test_dispatch_in_process_failure_is_retryable_before_admission(
     assert len(retry_turns.submitted) == 1
 
 
+def test_provenance_mismatch_rebinds_only_the_stale_session(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    ledger = EventLedger(tmp_path / "events.sqlite3")
+    event = _event_in_context_ready(ledger)
+
+    class StaleTurns:
+        async def submit(self, _session_id: str, _content: str) -> object:
+            raise ProgrammaticTurnPreAdmissionError(
+                "programmatic Turn session provenance 不匹配",
+                reason="session_provenance_mismatch",
+            )
+
+    class Checkouts:
+        def prepare(self, _event: object, _item: object) -> object:
+            return SimpleNamespace(path=tmp_path / "checkout")
+
+        def cleanup(self, _operation_id: str) -> bool:
+            return True
+
+    watch = GitHubWatch(
+        client=FakeGitHub(),  # type: ignore[arg-type]
+        ledger=ledger,
+        checkouts=Checkouts(),  # type: ignore[arg-type]
+        data_dir=tmp_path,
+        mention="@akashic-review-bot",
+        bot_login="akashic-review-bot[bot]",
+    )
+    _prepare_context(monkeypatch, watch, tmp_path)
+
+    asyncio.run(watch._process_event(event, StaleTurns()))
+
+    item = ledger.get_item("owner/repo", "issue", 1)
+    assert item is not None and item.thread_id is None
+    assert ledger.get_event(event.event_key).status == "discovered"
+
+    retry_turns = FakeTurns()
+    asyncio.run(watch._process_event(ledger.get_event(event.event_key), retry_turns))
+    assert retry_turns.created == [
+        {
+            "skip_memory_retrieval": True,
+            "source": "github-watch",
+            "repo": "owner/repo",
+            "item": "issue#1",
+        }
+    ]
+    assert retry_turns.submitted[0][0] == "thread-created"
+
+
 def test_dispatch_does_not_guess_for_an_unclassified_exception(
     tmp_path: Path,
     monkeypatch,

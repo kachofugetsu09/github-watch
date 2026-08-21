@@ -15,7 +15,9 @@ if "agent.plugin_composition" not in sys.modules:
     composition = ModuleType("agent.plugin_composition")
 
     class ProgrammaticTurnPreAdmissionError(RuntimeError):
-        pass
+        def __init__(self, message: str, *, reason: str | None = None) -> None:
+            super().__init__(message)
+            self.reason = reason
 
     class ProgrammaticTurnUncertainError(RuntimeError):
         pass

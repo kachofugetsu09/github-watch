@@ -197,6 +197,30 @@ class EventLedger:
                 (thread_id, utc_now(), repo, kind, number),
             )
 
+    def clear_thread(
+        self,
+        repo: str,
+        kind: str,
+        number: int,
+        *,
+        expected_thread_id: str,
+    ) -> None:
+        """Forget one unusable Session only when its durable identity is unchanged."""
+
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE items SET thread_id = NULL, updated_at = ?
+                WHERE repo = ? AND kind = ? AND number = ? AND thread_id = ?
+                """,
+                (utc_now(), repo, kind, number, expected_thread_id),
+            )
+        if cursor.rowcount != 1:
+            raise RuntimeError(
+                "GitHub Watch Session identity changed before recovery: "
+                f"{repo}:{kind}:{number}"
+            )
+
     def create_event(
         self,
         *,

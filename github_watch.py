@@ -358,6 +358,22 @@ class GitHubWatch:
                 "pre-admission failure reached an unexpected event state: "
                 f"{event.event_key}={current.status}"
             )
+        if error.reason == "session_provenance_mismatch":
+            if current.thread_id is None:
+                raise RuntimeError(
+                    "provenance mismatch 缺少待替换的 Session identity"
+                )
+            self._ledger.clear_thread(
+                event.repo,
+                event.kind,
+                event.number,
+                expected_thread_id=current.thread_id,
+            )
+            logger.warning(
+                "github-watch discarded stale programmatic Session event=%s session=%s",
+                event.event_key,
+                current.thread_id,
+            )
         try:
             await asyncio.to_thread(self._checkouts.cleanup, event.operation_id)
         except OSError:
