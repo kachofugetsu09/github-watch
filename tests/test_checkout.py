@@ -76,6 +76,14 @@ def test_prepare_pr_binds_exact_head_and_cleanup(tmp_path: Path, monkeypatch) ->
         "clone" in command and "--mirror" in command
         for command in authenticated_commands
     )
+    assert [
+        "git",
+        "-C",
+        str(tmp_path / "mirror" / "owner" / "repo.git"),
+        "config",
+        "core.symlinks",
+        "false",
+    ] in commands
     assert manager.get("a" * 32) == state
     assert manager.cleanup("a" * 32)
     assert not state.path.parent.exists()
@@ -201,6 +209,25 @@ def test_active_detached_worktree_does_not_block_fetch(tmp_path: Path) -> None:
 
     assert _git_output(mirror, "rev-parse", "refs/heads/main") == expected
     assert _git_output(checkout, "rev-parse", "--abbrev-ref", "HEAD") == "HEAD"
+
+
+def test_checkout_materializes_repository_symlinks_as_regular_files(
+    tmp_path: Path,
+) -> None:
+    source, mirror = _create_local_mirror(tmp_path)
+    (source / "target").write_text("target\n", encoding="utf-8")
+    (source / "link").symlink_to("target")
+    _git(source, "add", "target", "link")
+    _git(source, "commit", "-m", "add symlink")
+    _git(source, "push", "origin", "main")
+    _git(mirror, "fetch", "origin", "+refs/heads/*:refs/heads/*")
+
+    checkout = tmp_path / "regular-link-worktree"
+    _git(mirror, "config", "core.symlinks", "false")
+    _git(mirror, "worktree", "add", "--detach", str(checkout), "main")
+
+    assert not (checkout / "link").is_symlink()
+    assert (checkout / "link").read_text(encoding="utf-8") == "target"
 
 
 def test_cleanup_removes_attached_worktree(tmp_path: Path, monkeypatch) -> None:

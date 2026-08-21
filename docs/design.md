@@ -2,7 +2,7 @@
 
 ## 目标语义
 
-- 不使用 webhook；由 Akashic Plugin API v2 的 interval job 串行轮询。
+- 不使用 webhook；由 Akashic Plugin API v3 的 stable snapshot Timer 串行轮询。
 - 只列出 open Issue 和 open PR；关闭或已合并对象不进入首次 baseline 和后续轮询。
 - 首次启用只建立 baseline，不回复已有 Issue/PR。
 - baseline 后的新 Issue/PR 只唤醒一次，默认只分析并 comment。
@@ -33,11 +33,11 @@
 └──────────┬───────────┘
            ▼
 ┌──────────────────────┐
-│ Stable Control thread│  fresh turn per allowed event
+│ Stable Agent Session │  fresh programmatic Turn per allowed event
 └──────────┬───────────┘
            ▼
 ┌──────────────────────┐
-│ Fire-and-forget turn │  return after turn/start admission
+│ Fire-and-forget turn │  return after programmatic Turn admission
 └──────────┬───────────┘
            ▼
 ┌──────────────────────┐
@@ -46,9 +46,9 @@
 ```
 
 GitHub 保存远程权威事实；`events.sqlite3` 保存消费和恢复事实；Akashic
-`sessions.db` 只追加稳定 thread 与 turn 消息。thread metadata 关闭 memory retrieval 和
+`sessions.db` 只追加稳定 Session 与 Turn 消息。Session metadata 关闭 memory retrieval 和
 post-memory，避免 GitHub 任务进入长期记忆。每个仓库在 `plugin-data` 中复用裸镜像，每个
-operation 从精确提交创建唯一 detached worktree；after-turn 按 control turn ID 找回并删除，
+operation 从精确提交创建唯一 detached worktree；typed TurnCommitted 按 Core Turn ID 找回并删除，
 进程中断时由轮询 TTL 清扫工作目录，并在下次 fetch 前 prune 已失效的 worktree 管理记录。
 
 配置通知目标时，prompt 允许 Agent 在需要维护者决策、关键阻塞/风险或极重要结果时，向固定主
@@ -72,7 +72,7 @@ discovered → claimed → context_ready → turn_submitting → dispatched
 
 - `claimed/context_ready` 在重启后可安全回到 `discovered`，因为 turn 尚未提交。
 - `turn_submitting` 中断后转为 `manual_reconcile`，不自动重试。
-- `turn/start` 返回 turn id 后立即进入终态 `dispatched`；插件不等待 `turn/completed`。
+- programmatic Turn 返回 identity 后立即进入终态 `dispatched`；插件不等待 Turn 完成。
 - Agent 自行发送 comment，发送前检查稳定 operation marker，已有则不重复发送。
 - 带 operation marker 的 comment 永不触发 owner mention，避免 owner 凭证发送时形成自激循环。
 
@@ -90,7 +90,7 @@ Git remote 和日志都不写入凭证。
 
 ## 轮询实践
 
-请求使用认证、默认 120 秒周期、稳定排序和串行调度。稳定事件键和 SQLite 账本阻止同一
+请求使用认证、默认 120 秒周期、稳定排序和 Core Timer 串行调度。稳定事件键和 SQLite 账本阻止同一
 Issue/PR 被重复处理；列表仍会按周期检查，但每页保留 ETag 并发送 `If-None-Match`，
 `304` 复用已验证页。`Retry-After` 或 rate-limit reset 存在时，客户端在本地阻断新 HTTP
 请求直到恢复时间。
@@ -98,6 +98,31 @@ Issue/PR 被重复处理；列表仍会按周期检查，但每页保留 ETag �
 GET 和短命 installation token 交换遇到短暂 TLS、连接或不完整响应时最多尝试三次；仍失败
 则进入五分钟传输冷却，避免后台任务每轮制造重复请求和完整异常栈。恢复后的首个 HTTP 响应
 记录一次恢复日志。comment、review 等业务写请求保持单次发送，传输结果不确定时绝不自动重试。
+
+## v3 组合所有权
+
+```text
+┌──────────────────┐  core.background_jobs ┌────────────────────┐
+│ GitHub Watch     │ ◀──────────────── │ stable snapshot    │
+│ polling + ledger │                   │ cadence + coalesce │
+└────────┬─────────┘                   └────────────────────┘
+         │ BackgroundJobContext.turns
+         ▼
+┌──────────────────┐  core.background_jobs ┌────────────────────┐
+│ domain dispatch  │ ───────────────────▶ │ Session/Turn owner │
+└────────┬─────────┘                   └────────────────────┘
+         │ TOOL_CATALOG descriptors + typed TurnCommitted listener
+         ▼
+┌──────────────────┐                   ┌────────────────────────┐
+│ GitHub/checkout  │                   │ core.tool_catalog/events│
+│ SQLite/evidence  │                   │ registry + timing      │
+└──────────────────┘                   └────────────────────────┘
+```
+
+插件不取得 Core control plane、Session store 或 job host。`BackgroundJobContext.turns` 只接受
+创建 invocation-scoped Session 与提交普通输入；Core 负责生成不可伪造的 Session/Turn receipt。
+Tool 的 operation/thread 绑定仍由 SQLite event identity 与 Core 提供的不可变 Tool execution
+context 双重确定，不再重复读取可变 Session metadata。
 
 参考：
 

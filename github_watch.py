@@ -6,18 +6,34 @@ import asyncio
 import json
 import logging
 import re
+from collections.abc import Mapping
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
-from agent.control.client import ControlClient
+from agent.plugin_composition import (
+    ProgrammaticTurnPreAdmissionError,
+    ProgrammaticTurnUncertainError,
+)
 
 from .context_bundle import ContextBundle
 from .checkout import CheckoutManager
-from .github_client import GitHubClient, GitHubTransportUnavailable
+from .github_client import (
+    GitHubApiError,
+    GitHubClient,
+    GitHubTransportUnavailable,
+)
 from .ledger import EventLedger, EventState
 from .operations import GitHubOperations
 
 logger = logging.getLogger("plugin.github-watch")
+
+
+class ProgrammaticTurnPort(Protocol):
+    """Submit one invocation-scoped programmatic Turn without Core control access."""
+
+    async def create_session(self, *, metadata: Mapping[str, object]) -> str: ...
+
+    async def submit(self, session_id: str, content: str) -> object: ...
 
 
 class GitHubWatch:
@@ -30,7 +46,6 @@ class GitHubWatch:
         ledger: EventLedger,
         checkouts: CheckoutManager,
         data_dir: Path,
-        control_endpoint: str,
         mention: str,
         bot_login: str,
         operations: GitHubOperations | None = None,
@@ -42,7 +57,6 @@ class GitHubWatch:
         self._checkouts = checkouts
         self._operations = operations
         self._context = ContextBundle(client, data_dir)
-        self._control_endpoint = control_endpoint
         escaped_mention = re.escape(mention.casefold())
         self._mention_pattern = re.compile(
             rf"(?<![A-Za-z0-9-]){escaped_mention}(?![A-Za-z0-9-])"
@@ -51,7 +65,11 @@ class GitHubWatch:
         self._notify_channel = notify_channel
         self._notify_chat_id = notify_chat_id
 
-    async def poll(self, repositories: list[str]) -> None:
+    async def poll(
+        self,
+        repositories: list[str],
+        turns: ProgrammaticTurnPort,
+    ) -> None:
         """Poll repositories serially, then drain each newly discovered event once."""
 
         # 1. Recover checkout storage before reading new remote state.
@@ -83,7 +101,7 @@ class GitHubWatch:
 
         # 3. Run only durable events that have never begun an external effect
         for event in self._ledger.pending_events():
-            await self._process_event(event)
+            await self._process_event(event, turns)
 
     def _discover_repository(self, repo: str) -> None:
         """Classify fresh GitHub state without treating updated_at as a wake signal."""
@@ -187,7 +205,11 @@ class GitHubWatch:
                 last_comment_id=self._maximum_comment_id(comments),
             )
 
-    async def _process_event(self, event: EventState) -> None:
+    async def _process_event(
+        self,
+        event: EventState,
+        turns: ProgrammaticTurnPort,
+    ) -> None:
         """Run one event through explicit pre-effect and external-effect phases."""
 
         self._ledger.transition(
@@ -235,32 +257,12 @@ class GitHubWatch:
         )
 
         try:
-            await self._dispatch_turn(event, manifest, checkout.path)
-        except Exception as exc:
-            current = self._ledger.get_event(event.event_key)
-            if current.status == "context_ready":
-                await asyncio.to_thread(self._checkouts.cleanup, event.operation_id)
-                self._ledger.transition(
-                    event.event_key,
-                    expected=("context_ready",),
-                    status="discovered",
-                    error=repr(exc),
-                )
-                logger.exception(
-                    "github-watch dispatch failed safely; retry next poll event=%s",
-                    event.event_key,
-                )
-                return
-            self._ledger.transition(
-                event.event_key,
-                expected=(current.status,),
-                status="dispatch_unconfirmed",
-                error=repr(exc),
-            )
-            logger.exception(
-                "github-watch dispatch is uncertain; refusing retry event=%s",
-                event.event_key,
-            )
+            await self._dispatch_turn(event, manifest, checkout.path, turns)
+        except ProgrammaticTurnPreAdmissionError as exc:
+            await self._retry_pre_admission(event, exc)
+            return
+        except ProgrammaticTurnUncertainError as exc:
+            self._mark_manual_reconcile(event, exc)
             return
         logger.info(
             "github-watch dispatched event=%s thread=%s turn=%s",
@@ -274,47 +276,64 @@ class GitHubWatch:
         event: EventState,
         manifest: Path,
         checkout_path: Path,
+        turns: ProgrammaticTurnPort,
     ) -> None:
         """Submit one durable turn and return immediately after admission."""
 
-        async with await ControlClient.connect(self._control_endpoint) as client:
-            item = self._ledger.get_item(event.repo, event.kind, event.number)
-            if item is None:
-                raise RuntimeError(f"event item missing: {event.event_key}")
-            thread_id = item.thread_id
-            if thread_id is None:
-                thread = await client.start_thread(
-                    metadata={
-                        "skip_post_memory": True,
-                        "skip_memory_retrieval": True,
-                        "source": "github-watch",
-                        "repo": event.repo,
-                        "item": f"{event.kind}#{event.number}",
-                    }
-                )
-                raw_thread_id = thread.get("id") or thread.get("threadId")
-                if not isinstance(raw_thread_id, str) or not raw_thread_id:
-                    raise RuntimeError(f"thread/start missing id: {thread}")
-                thread_id = raw_thread_id
-                self._ledger.set_thread(event.repo, event.kind, event.number, thread_id)
-            self._ledger.transition(
-                event.event_key,
-                expected=("context_ready",),
-                status="turn_submitting",
-                thread_id=thread_id,
+        # 1. 复用每个 Issue/PR 的稳定 Session，首次创建后先持久化 identity。
+        item = self._ledger.get_item(event.repo, event.kind, event.number)
+        if item is None:
+            raise RuntimeError(f"event item missing: {event.event_key}")
+        session_id = item.thread_id
+        if session_id is None:
+            session_id = await turns.create_session(
+                metadata={
+                    "skip_memory_retrieval": True,
+                    "source": "github-watch",
+                    "repo": event.repo,
+                    "item": f"{event.kind}#{event.number}",
+                }
             )
-            handle = await client.start_turn(
-                thread_id,
-                self._build_prompt(event, manifest, checkout_path),
-                detached=True,
+            if not isinstance(session_id, str) or not session_id:
+                raise TypeError("programmatic Session creator returned invalid identity")
+            self._ledger.set_thread(event.repo, event.kind, event.number, session_id)
+
+        # 2. 在不确定提交边界之前完成纯本地 prompt 构建。
+        prompt = self._build_prompt(event, manifest, checkout_path)
+
+        # 3. 写入不确定提交边界，再让 Core 准入一个 detached ordinary Turn。
+        self._ledger.transition(
+            event.event_key,
+            expected=("context_ready",),
+            status="turn_submitting",
+            thread_id=session_id,
+        )
+        try:
+            receipt = await turns.submit(
+                session_id,
+                prompt,
             )
-            self._ledger.transition(
-                event.event_key,
-                expected=("turn_submitting",),
-                status="dispatched",
-                turn_id=handle.id,
+        except asyncio.CancelledError as exc:
+            raise ProgrammaticTurnUncertainError(
+                "programmatic Turn admission was cancelled after Core critical section"
+            ) from exc
+        receipt_session_id = getattr(receipt, "session_id", None)
+        turn_id = getattr(receipt, "turn_id", None)
+        if receipt_session_id != session_id:
+            raise ProgrammaticTurnUncertainError(
+                "programmatic Turn receipt returned mismatched Session identity"
             )
-            await self._ack_dispatched(event)
+        if not isinstance(turn_id, str) or not turn_id:
+            raise ProgrammaticTurnUncertainError(
+                "programmatic Turn receipt returned invalid Turn identity"
+            )
+        self._ledger.transition(
+            event.event_key,
+            expected=("turn_submitting",),
+            status="dispatched",
+            turn_id=turn_id,
+        )
+        await self._ack_dispatched(event)
 
     async def _ack_dispatched(self, event: EventState) -> None:
         """React with :eyes: on the item itself once a turn has been admitted."""
@@ -323,10 +342,79 @@ class GitHubWatch:
             return
         try:
             await asyncio.to_thread(self._operations.react, event, "eyes")
-        except Exception:
+        except (GitHubApiError, GitHubTransportUnavailable, OSError):
             logger.warning(
                 "github-watch ack reaction failed event=%s", event.event_key, exc_info=True
             )
+
+    async def _retry_pre_admission(
+        self,
+        event: EventState,
+        error: ProgrammaticTurnPreAdmissionError,
+    ) -> None:
+        current = self._ledger.get_event(event.event_key)
+        if current.status not in {"context_ready", "turn_submitting"}:
+            raise RuntimeError(
+                "pre-admission failure reached an unexpected event state: "
+                f"{event.event_key}={current.status}"
+            )
+        if error.reason == "session_provenance_mismatch":
+            if current.thread_id is None:
+                raise RuntimeError(
+                    "provenance mismatch 缺少待替换的 Session identity"
+                )
+            self._ledger.clear_thread(
+                event.repo,
+                event.kind,
+                event.number,
+                expected_thread_id=current.thread_id,
+            )
+            logger.warning(
+                "github-watch discarded stale programmatic Session event=%s session=%s",
+                event.event_key,
+                current.thread_id,
+            )
+        try:
+            await asyncio.to_thread(self._checkouts.cleanup, event.operation_id)
+        except OSError:
+            logger.warning(
+                "github-watch checkout cleanup deferred to TTL event=%s",
+                event.event_key,
+                exc_info=True,
+            )
+        self._ledger.transition(
+            event.event_key,
+            expected=(current.status,),
+            status="discovered",
+            error=repr(error),
+        )
+        logger.warning(
+            "github-watch pre-admission dispatch failure; retry next poll event=%s",
+            event.event_key,
+        )
+
+    def _mark_manual_reconcile(
+        self,
+        event: EventState,
+        error: ProgrammaticTurnUncertainError,
+    ) -> None:
+        current = self._ledger.get_event(event.event_key)
+        if current.status != "turn_submitting":
+            raise RuntimeError(
+                "uncertain Turn admission reached an unexpected event state: "
+                f"{event.event_key}={current.status}"
+            )
+        self._ledger.transition(
+            event.event_key,
+            expected=("turn_submitting",),
+            status="manual_reconcile",
+            error=repr(error),
+        )
+        logger.error(
+            "github-watch Turn admission uncertain; manual reconcile required "
+            "event=%s",
+            event.event_key,
+        )
 
     def _build_prompt(
         self,

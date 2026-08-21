@@ -1,4 +1,4 @@
-"""Akashic API v2 entrypoint for the GitHub polling bot."""
+"""Akashic API v3 entrypoint for the GitHub polling bot."""
 
 from __future__ import annotations
 
@@ -6,22 +6,29 @@ import asyncio
 import json
 import logging
 import re
+from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
 
-from agent.plugins import (
+from agent.plugin_composition import (
+    BACKGROUND_JOBS,
+    TOOL_CATALOG,
+    BackgroundJobDefinition,
+    Context,
     IntervalTrigger,
-    Plugin,
-    PluginJobContext,
-    PluginJobSpec,
-    tool,
+    PluginToolDefinition,
 )
-from agent.tools.base import get_current_tool_context
+from agent.turn_events.after_turn import AFTER_TURN_COMMITTED
+from bus.events_lifecycle import TurnCommitted
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from .checkout import CheckoutManager
 from .github_client import GitHubClient
-from .github_watch import GitHubWatch
+from .github_watch import (
+    GitHubWatch,
+    ProgrammaticTurnPort,
+)
 from .ledger import EventLedger, EventState
 from .operations import GitHubOperations
 
@@ -38,7 +45,6 @@ class GitHubWatchConfig(BaseModel):
     bot_login: str = "akashic-review-bot[bot]"
     poll_seconds: int = Field(default=120, ge=15)
     checkout_ttl_seconds: int = Field(default=86_400, ge=300)
-    control_endpoint: str | None = None
     notify_channel: str | None = None
     notify_chat_id: str | None = None
 
@@ -60,7 +66,7 @@ class GitHubWatchConfig(BaseModel):
         return value
 
     @model_validator(mode="after")
-    def validate_notification_target(self) -> "GitHubWatchConfig":
+    def validate_notification_target(self) -> GitHubWatchConfig:
         values = (self.notify_channel, self.notify_chat_id)
         if (values[0] is None) != (values[1] is None):
             raise ValueError("notify_channel and notify_chat_id must be configured together")
@@ -69,282 +75,341 @@ class GitHubWatchConfig(BaseModel):
         return self
 
 
-class GitHubWatchPlugin(Plugin):
-    api_version = 2
-    name = "github-watch"
-    version = "1.2.12"
-    desc = "Poll GitHub and wake one stable Akashic thread per issue or PR"
-    ConfigModel = GitHubWatchConfig
+@dataclass(frozen=True, slots=True)
+class _BoundRuntime:
+    ledger: EventLedger
+    checkouts: CheckoutManager
+    operations: GitHubOperations
+    watch: GitHubWatch
 
-    def activate(self) -> None:
-        """校验运行前提，并等待正式调用绑定当前 plugin-data。"""
 
-        config = cast(GitHubWatchConfig, self.context.config)
-        data_dir = self.context.data_dir
-        workspace = self.context.workspace
-        if data_dir is None or workspace is None:
-            raise RuntimeError("github-watch requires plugin data_dir and workspace")
-        pem_path = Path(config.pem_path).expanduser()
-        if not pem_path.is_file():
-            raise FileNotFoundError(f"GitHub App PEM does not exist: {pem_path}")
-        self._runtime_data_dir: Path | None = None
+_config: GitHubWatchConfig | None = None
+_data_dir: Path | None = None
+_bound: _BoundRuntime | None = None
 
-    def _ensure_runtime(self) -> None:
-        """为当前 generation 的正式 plugin-data 初始化持久状态与 GitHub 客户端。"""
 
-        # 1. 候选先使用隔离目录，正式切换后必须按当前 context 重新绑定。
-        config = cast(GitHubWatchConfig, self.context.config)
-        data_dir = self.context.data_dir
-        workspace = self.context.workspace
-        if data_dir is None or workspace is None:
-            raise RuntimeError("github-watch requires plugin data_dir and workspace")
-        if self._runtime_data_dir == data_dir:
-            return
+def _require_config() -> GitHubWatchConfig:
+    config = _config
+    if config is None:
+        raise RuntimeError("github-watch plugin has not been applied")
+    return config
 
-        # 2. 初始化当前目录对应的账本、checkout 与远程操作。
-        pem_path = Path(config.pem_path).expanduser()
-        data_dir.mkdir(parents=True, exist_ok=True)
-        ledger = EventLedger(data_dir / "events.sqlite3")
-        ledger.integrity_check()
-        recovered = ledger.recover_interrupted()
-        if any(recovered.values()):
-            logger.warning("github-watch recovered interrupted states: %s", recovered)
-        endpoint = config.control_endpoint or str(workspace / "akashic.sock")
-        client = GitHubClient(
-            app_id=config.app_id,
-            installation_id=config.installation_id,
-            pem_path=pem_path,
-        )
-        checkouts = CheckoutManager(
-            client,
-            root=data_dir / "checkouts",
-            mirror_root=data_dir / "mirror",
-            ttl_seconds=config.checkout_ttl_seconds,
-        )
-        removed = checkouts.sweep()
-        if removed:
-            logger.warning("github-watch swept expired checkouts count=%d", removed)
-        self._ledger = ledger
-        self._checkouts = checkouts
-        self._operations = GitHubOperations(client, checkouts)
-        self._watch = GitHubWatch(
+
+def _require_data_dir() -> Path:
+    data_dir = _data_dir
+    if data_dir is None:
+        raise RuntimeError("github-watch plugin data root has not been bound")
+    return data_dir
+
+
+def _ensure_formal_runtime() -> _BoundRuntime:
+    """Create the formal plugin runtime only when a formal handler executes."""
+
+    global _bound
+    if _bound is not None:
+        return _bound
+    config = _require_config()
+    data_dir = _require_data_dir()
+
+    # 1. Open plugin-owned durable state and recover only known safe phases.
+    data_dir.mkdir(parents=True, exist_ok=True)
+    ledger = EventLedger(data_dir / "events.sqlite3")
+    ledger.integrity_check()
+    recovered = ledger.recover_interrupted()
+    if any(recovered.values()):
+        logger.warning("github-watch recovered interrupted states: %s", recovered)
+
+    # 2. Build GitHub, checkout, and operation owners inside the formal boundary.
+    client = GitHubClient(
+        app_id=config.app_id,
+        installation_id=config.installation_id,
+        pem_path=Path(config.pem_path).expanduser(),
+    )
+    checkouts = CheckoutManager(
+        client,
+        root=data_dir / "checkouts",
+        mirror_root=data_dir / "mirror",
+        ttl_seconds=config.checkout_ttl_seconds,
+    )
+    removed = checkouts.sweep()
+    if removed:
+        logger.warning("github-watch swept expired checkouts count=%d", removed)
+    operations = GitHubOperations(client, checkouts)
+
+    # 3. Publish the complete runtime only after all initialization succeeds.
+    _bound = _BoundRuntime(
+        ledger=ledger,
+        checkouts=checkouts,
+        operations=operations,
+        watch=GitHubWatch(
             client=client,
             ledger=ledger,
             checkouts=checkouts,
             data_dir=data_dir,
-            control_endpoint=endpoint,
             mention=config.mention,
             bot_login=config.bot_login,
-            operations=self._operations,
+            operations=operations,
             notify_channel=config.notify_channel,
             notify_chat_id=config.notify_chat_id,
-        )
-        self._runtime_data_dir = data_dir
-
-    def jobs(self) -> list[PluginJobSpec]:
-        config = cast(GitHubWatchConfig, self.context.config)
-        return [
-            PluginJobSpec(
-                id="poll",
-                triggers=[IntervalTrigger(seconds=config.poll_seconds)],
-                handler=self.poll,
-                coalesce=True,
-            )
-        ]
-
-    async def poll(self, ctx: PluginJobContext) -> None:
-        self._ensure_runtime()
-        config = cast(GitHubWatchConfig, ctx.plugin_context.config)
-        await self._watch.poll(config.repositories)
-
-    def after_turn_modules(self) -> list[object]:
-        return [_CheckoutCleanupModule(self)]
-
-    @tool(
-        name="github_watch_runtime_info",
-        risk="read-only",
-        always_on=True,
+        ),
     )
-    async def runtime_info(self, event: object) -> dict[str, str]:
-        """Return the active plugin identity and checkout recovery policy."""
+    return _bound
 
-        _ = event
-        return {
-            "plugin": self.name,
-            "version": self.version,
-            "checkout_mode": "detached-commit",
-            "mirror_recovery": "worktree-prune-before-fetch",
-        }
 
-    @tool(
-        name="github_watch_post_comment",
-        risk="external-side-effect",
-        always_on=True,
-    )
-    async def post_comment(
-        self,
-        event: object,
-        operation_id: str,
-        body: str,
-    ) -> str:
-        """以当前 github-watch operation 绑定的 GitHub App Bot 身份发布 Issue comment。
+def _require_bound_runtime() -> _BoundRuntime:
+    bound = _bound
+    if bound is None:
+        raise RuntimeError("github-watch formal runtime has not been initialized")
+    return bound
 
-        Args:
-            operation_id: Prompt 中给出的 32 位 operation ID。
-            body: 不含 operation marker 的中文评论正文。
-        """
 
-        authorized = self._authorized_event(operation_id)
-        result = await asyncio.to_thread(
-            self._operations.post_comment,
-            authorized,
-            body,
+def _runtime_info() -> dict[str, str]:
+    return {
+        "plugin": name,
+        "version": version,
+        "checkout_mode": "detached-commit",
+        "mirror_recovery": "worktree-prune-before-fetch",
+    }
+
+
+def _authorized_event(context: Any, operation_id: str) -> EventState:
+    """Authorize an operation against the explicit Core tool provenance."""
+
+    origin_session_key = context.origin_session_key
+    if not origin_session_key:
+        raise PermissionError("github-watch tool requires a live turn context")
+    bound = _ensure_formal_runtime()
+    event = bound.ledger.get_event_by_operation(operation_id)
+    if (
+        event.status not in {"turn_submitting", "dispatched"}
+        or event.thread_id != origin_session_key
+    ):
+        raise PermissionError(
+            "operation does not belong to the current dispatched session"
         )
-        return json.dumps(result, ensure_ascii=False, sort_keys=True)
+    return event
 
-    @tool(
-        name="github_watch_submit_review",
-        risk="external-side-effect",
-        always_on=True,
+
+def _authorized_code_event(context: Any, operation_id: str) -> EventState:
+    event = _authorized_event(context, operation_id)
+    if event.trigger_kind != "owner_mention":
+        raise PermissionError("code changes require an owner mention event")
+    return event
+
+
+async def run_github_watch_poll(context: Any) -> None:
+    """Poll GitHub and admit each discovered event through the invocation port."""
+
+    turns = context.turns
+    if turns is None:
+        raise RuntimeError("candidate GitHub Watch job cannot access programmatic Turns")
+    config = _require_config()
+    bound = _ensure_formal_runtime()
+    await bound.watch.poll(config.repositories, cast(ProgrammaticTurnPort, turns))
+
+
+async def run_github_watch_runtime_info(
+    context: Any,
+    arguments: Mapping[str, object],
+) -> str:
+    del arguments
+    _ = context
+    _ensure_formal_runtime()
+    return json.dumps(_runtime_info(), ensure_ascii=False, sort_keys=True)
+
+
+async def run_github_watch_post_comment(
+    context: Any,
+    arguments: Mapping[str, object],
+) -> str:
+    event = _authorized_event(context, cast(str, arguments["operation_id"]))
+    bound = _require_bound_runtime()
+    result = await asyncio.to_thread(
+        bound.operations.post_comment,
+        event,
+        cast(str, arguments["body"]),
     )
-    async def submit_review(
-        self,
-        event: object,
-        operation_id: str,
-        body: str,
-    ) -> str:
-        """以 GitHub App Bot 身份向当前 PR 提交一次 COMMENT review。
+    return json.dumps(result, ensure_ascii=False, sort_keys=True)
 
-        Args:
-            operation_id: Prompt 中给出的 32 位 operation ID。
-            body: 不含 operation marker 的中文 review 正文。
-        """
 
-        authorized = self._authorized_event(operation_id)
-        result = await asyncio.to_thread(
-            self._operations.submit_review,
-            authorized,
-            body,
-        )
-        return json.dumps(result, ensure_ascii=False, sort_keys=True)
-
-    @tool(
-        name="github_watch_push_branch",
-        risk="external-side-effect",
-        always_on=True,
+async def run_github_watch_submit_review(
+    context: Any,
+    arguments: Mapping[str, object],
+) -> str:
+    event = _authorized_event(context, cast(str, arguments["operation_id"]))
+    bound = _require_bound_runtime()
+    result = await asyncio.to_thread(
+        bound.operations.submit_review,
+        event,
+        cast(str, arguments["body"]),
     )
-    async def push_branch(
-        self,
-        event: object,
-        operation_id: str,
-        branch_suffix: str,
-    ) -> str:
-        """用 GitHub App token 将当前临时仓库的已提交改动推到 operation 唯一分支。
+    return json.dumps(result, ensure_ascii=False, sort_keys=True)
 
-        Args:
-            operation_id: Prompt 中给出的 32 位 operation ID。
-            branch_suffix: 小写字母数字开头的简短分支后缀。
-        """
 
-        authorized = self._authorized_code_event(operation_id)
-        result = await asyncio.to_thread(
-            self._operations.push_branch,
-            authorized,
-            branch_suffix,
-        )
-        return json.dumps(result, ensure_ascii=False, sort_keys=True)
-
-    @tool(
-        name="github_watch_create_pr",
-        risk="external-side-effect",
-        always_on=True,
+async def run_github_watch_push_branch(
+    context: Any,
+    arguments: Mapping[str, object],
+) -> str:
+    event = _authorized_code_event(context, cast(str, arguments["operation_id"]))
+    bound = _require_bound_runtime()
+    result = await asyncio.to_thread(
+        bound.operations.push_branch,
+        event,
+        cast(str, arguments["branch_suffix"]),
     )
-    async def create_pr(
-        self,
-        event: object,
-        operation_id: str,
-        title: str,
-        body: str,
-    ) -> str:
-        """以 GitHub App Bot 身份为当前 operation 已推送的分支创建 PR。
+    return json.dumps(result, ensure_ascii=False, sort_keys=True)
 
-        Args:
-            operation_id: Prompt 中给出的 32 位 operation ID。
-            title: PR 标题。
-            body: 不含 operation marker 的 PR 正文。
-        """
 
-        authorized = self._authorized_code_event(operation_id)
-        result = await asyncio.to_thread(
-            self._operations.create_pull,
-            authorized,
-            title=title,
-            body=body,
+async def run_github_watch_create_pr(
+    context: Any,
+    arguments: Mapping[str, object],
+) -> str:
+    event = _authorized_code_event(context, cast(str, arguments["operation_id"]))
+    bound = _require_bound_runtime()
+    result = await asyncio.to_thread(
+        bound.operations.create_pull,
+        event,
+        title=cast(str, arguments["title"]),
+        body=cast(str, arguments["body"]),
+    )
+    return json.dumps(result, ensure_ascii=False, sort_keys=True)
+
+
+def _cleanup_committed_turn(event: TurnCommitted) -> None:
+    bound = _bound
+    if bound is None:
+        return
+    owned = bound.ledger.get_event_by_turn(event.turn_id)
+    if owned is None or owned.thread_id != event.session_key:
+        return
+    try:
+        removed = bound.checkouts.cleanup(owned.operation_id)
+    except OSError:
+        logger.exception(
+            "github-watch checkout cleanup deferred to TTL event=%s",
+            owned.event_key,
         )
-        return json.dumps(result, ensure_ascii=False, sort_keys=True)
-
-    def _authorized_event(self, operation_id: str) -> EventState:
-        self._ensure_runtime()
-        context = get_current_tool_context()
-        if context is None or not context.origin_session_key:
-            raise PermissionError("github-watch tool requires a live turn context")
-        event = self._ledger.get_event_by_operation(operation_id)
-        if (
-            event.status not in {"turn_submitting", "dispatched"}
-            or event.thread_id != context.origin_session_key
-        ):
-            raise PermissionError("operation does not belong to the current dispatched thread")
-        manager = self.context.session_manager
-        if manager is None:
-            raise RuntimeError("github-watch requires session_manager")
-        session = manager.get_existing(context.origin_session_key)
-        metadata = session.metadata
-        if (
-            metadata.get("source") != "github-watch"
-            or metadata.get("repo") != event.repo
-            or metadata.get("item") != f"{event.kind}#{event.number}"
-        ):
-            raise PermissionError("session metadata does not match github-watch event")
-        return event
-
-    def _authorized_code_event(self, operation_id: str) -> EventState:
-        event = self._authorized_event(operation_id)
-        if event.trigger_kind != "owner_mention":
-            raise PermissionError("code changes require an owner mention event")
-        return event
-
-    def _cleanup_turn(self, session_key: str, turn_id: str) -> None:
-        self._ensure_runtime()
-        event = self._ledger.get_event_by_turn(turn_id)
-        if event is None or event.thread_id != session_key:
-            return
-        try:
-            removed = self._checkouts.cleanup(event.operation_id)
-        except OSError:
-            logger.exception(
-                "github-watch checkout cleanup deferred to TTL event=%s",
-                event.event_key,
-            )
-            return
-        if removed:
-            logger.info("github-watch checkout removed event=%s", event.event_key)
+        return
+    if removed:
+        logger.info("github-watch checkout removed event=%s", owned.event_key)
 
 
-class _CheckoutCleanupModule:
-    slot = "plugin.github_watch.checkout_cleanup"
-    requires = ("after_turn.fanout_committed",)
+def _on_turn_committed(event: TurnCommitted) -> None:
+    _cleanup_committed_turn(event)
 
-    def __init__(self, plugin: GitHubWatchPlugin) -> None:
-        self._plugin = plugin
 
-    async def run(self, frame: Any) -> Any:
-        state = frame.input.state
-        metadata = state.msg.metadata or {}
-        turn_id = metadata.get("control_turn_id")
-        if isinstance(turn_id, str) and turn_id:
-            await asyncio.to_thread(
-                self._plugin._cleanup_turn,
-                state.session_key,
-                turn_id,
-            )
-        return frame
+def _tool_definitions() -> tuple[PluginToolDefinition, ...]:
+    return (
+        PluginToolDefinition(
+            name="github_watch_runtime_info",
+            description="返回当前 GitHub Watch 插件版本和 checkout 恢复策略。",
+            parameters={
+                "type": "object",
+                "properties": {},
+                "required": [],
+                "additionalProperties": False,
+            },
+            handler_export="run_github_watch_runtime_info",
+            risk="read-only",
+            always_on=True,
+        ),
+        PluginToolDefinition(
+            name="github_watch_post_comment",
+            description="以当前 operation 绑定的 GitHub App Bot 发布 Issue comment。",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "operation_id": {"type": "string"},
+                    "body": {"type": "string"},
+                },
+                "required": ["operation_id", "body"],
+                "additionalProperties": False,
+            },
+            handler_export="run_github_watch_post_comment",
+            risk="external-side-effect",
+            always_on=True,
+        ),
+        PluginToolDefinition(
+            name="github_watch_submit_review",
+            description="以 GitHub App Bot 向当前 PR 提交一次 COMMENT review。",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "operation_id": {"type": "string"},
+                    "body": {"type": "string"},
+                },
+                "required": ["operation_id", "body"],
+                "additionalProperties": False,
+            },
+            handler_export="run_github_watch_submit_review",
+            risk="external-side-effect",
+            always_on=True,
+        ),
+        PluginToolDefinition(
+            name="github_watch_push_branch",
+            description="把当前临时仓库的提交推到 operation 唯一分支。",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "operation_id": {"type": "string"},
+                    "branch_suffix": {"type": "string"},
+                },
+                "required": ["operation_id", "branch_suffix"],
+                "additionalProperties": False,
+            },
+            handler_export="run_github_watch_push_branch",
+            risk="external-side-effect",
+            always_on=True,
+        ),
+        PluginToolDefinition(
+            name="github_watch_create_pr",
+            description="为当前 operation 已推送的分支创建 GitHub PR。",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "operation_id": {"type": "string"},
+                    "title": {"type": "string"},
+                    "body": {"type": "string"},
+                },
+                "required": ["operation_id", "title", "body"],
+                "additionalProperties": False,
+            },
+            handler_export="run_github_watch_create_pr",
+            risk="external-side-effect",
+            always_on=True,
+        ),
+    )
+
+
+api_version = 3
+name = "github-watch"
+version = "3.0.0"
+desc = "Poll GitHub and wake one stable Akashic Session per issue or PR"
+Config = GitHubWatchConfig
+inject = (BACKGROUND_JOBS, TOOL_CATALOG)
+
+
+async def apply(ctx: Context, config: GitHubWatchConfig) -> None:
+    """Register pure-v3 job, Tool catalog descriptors, and committed-turn cleanup."""
+
+    global _config, _data_dir, _bound
+    _config = config
+    _data_dir = ctx.data_root
+    _bound = None
+
+    # 1. Register declarations only; no candidate data or external client is touched.
+    await ctx.require(BACKGROUND_JOBS).register(
+        ctx,
+        BackgroundJobDefinition(
+            name="poll",
+            triggers=(IntervalTrigger(config.poll_seconds),),
+            handler_export="run_github_watch_poll",
+            programmatic_turns=True,
+        ),
+    )
+    catalog = ctx.require(TOOL_CATALOG)
+    for definition in _tool_definitions():
+        await catalog.register(ctx, definition)
+
+    # 2. Cleanup observes only the matching session and committed Turn identity.
+    await ctx.on(AFTER_TURN_COMMITTED, _on_turn_committed)
