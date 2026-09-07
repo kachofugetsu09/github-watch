@@ -3,17 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import re
-from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Protocol
-
-from agent.plugin_composition import (
-    ProgrammaticTurnPreAdmissionError,
-    ProgrammaticTurnUncertainError,
-)
 
 from .context_bundle import ContextBundle
 from .checkout import CheckoutManager
@@ -28,12 +23,21 @@ from .operations import GitHubOperations
 logger = logging.getLogger("plugin.github-watch")
 
 
-class ProgrammaticTurnPort(Protocol):
-    """Submit one invocation-scoped programmatic Turn without Core control access."""
+def _session_id(event: EventState) -> str:
+    identity = f"{event.repo}:{event.kind}:{event.number}".encode()
+    return "programmatic:github-watch:" + hashlib.sha256(identity).hexdigest()[:32]
 
-    async def create_session(self, *, metadata: Mapping[str, object]) -> str: ...
 
-    async def submit(self, session_id: str, content: str) -> object: ...
+def _input_message_id(event: EventState) -> str:
+    return "github-watch:" + event.operation_id
+
+
+class ProgrammaticMessagePort(Protocol):
+    """Admit one stable internal Session and append one idempotent Input Message."""
+
+    async def admit(self, session_id: str) -> None: ...
+
+    async def submit(self, session_id: str, message_id: str, content: str) -> str: ...
 
 
 class GitHubWatch:
@@ -68,9 +72,9 @@ class GitHubWatch:
     async def poll(
         self,
         repositories: list[str],
-        turns: ProgrammaticTurnPort,
+        messages: ProgrammaticMessagePort,
     ) -> None:
-        """Poll repositories serially, then drain each newly discovered event once."""
+        """Poll repositories serially, then append each newly discovered Input once."""
 
         # 1. Recover checkout storage before reading new remote state.
         removed = await asyncio.to_thread(self._checkouts.sweep)
@@ -99,9 +103,9 @@ class GitHubWatch:
                     )
                 return
 
-        # 3. Run only durable events that have never begun an external effect
+        # 3. Run only durable events that have not admitted their Input Message.
         for event in self._ledger.pending_events():
-            await self._process_event(event, turns)
+            await self._process_event(event, messages)
 
     def _discover_repository(self, repo: str) -> None:
         """Classify fresh GitHub state without treating updated_at as a wake signal."""
@@ -208,9 +212,9 @@ class GitHubWatch:
     async def _process_event(
         self,
         event: EventState,
-        turns: ProgrammaticTurnPort,
+        messages: ProgrammaticMessagePort,
     ) -> None:
-        """Run one event through explicit pre-effect and external-effect phases."""
+        """Build local evidence, then admit one idempotent programmatic Message."""
 
         self._ledger.transition(
             event.event_key, expected=("discovered",), status="claimed"
@@ -257,81 +261,60 @@ class GitHubWatch:
         )
 
         try:
-            await self._dispatch_turn(event, manifest, checkout.path, turns)
-        except ProgrammaticTurnPreAdmissionError as exc:
-            await self._retry_pre_admission(event, exc)
-            return
-        except ProgrammaticTurnUncertainError as exc:
-            self._mark_manual_reconcile(event, exc)
-            return
+            await self._dispatch_message(event, manifest, checkout.path, messages)
+        except BaseException as error:
+            current = self._ledger.get_event(event.event_key)
+            if current.status == "message_submitting":
+                self._ledger.transition(
+                    event.event_key, expected=("message_submitting",),
+                    status="discovered", error=repr(error),
+                )
+            raise
         logger.info(
-            "github-watch dispatched event=%s thread=%s turn=%s",
+            "github-watch dispatched event=%s session=%s input=%s",
             event.event_key,
             self._ledger.get_event(event.event_key).thread_id,
-            self._ledger.get_event(event.event_key).turn_id,
+            self._ledger.get_event(event.event_key).input_message_id,
         )
 
-    async def _dispatch_turn(
+    async def _dispatch_message(
         self,
         event: EventState,
         manifest: Path,
         checkout_path: Path,
-        turns: ProgrammaticTurnPort,
+        messages: ProgrammaticMessagePort,
     ) -> None:
-        """Submit one durable turn and return immediately after admission."""
+        """Append one stable programmatic Input and return after Message admission."""
 
         # 1. 复用每个 Issue/PR 的稳定 Session，首次创建后先持久化 identity。
         item = self._ledger.get_item(event.repo, event.kind, event.number)
         if item is None:
             raise RuntimeError(f"event item missing: {event.event_key}")
-        session_id = item.thread_id
-        if session_id is None:
-            session_id = await turns.create_session(
-                metadata={
-                    "skip_memory_retrieval": True,
-                    "source": "github-watch",
-                    "repo": event.repo,
-                    "item": f"{event.kind}#{event.number}",
-                }
-            )
-            if not isinstance(session_id, str) or not session_id:
-                raise TypeError("programmatic Session creator returned invalid identity")
+        session_id = _session_id(event)
+        await messages.admit(session_id)
+        if item.thread_id != session_id:
             self._ledger.set_thread(event.repo, event.kind, event.number, session_id)
 
         # 2. 在不确定提交边界之前完成纯本地 prompt 构建。
         prompt = self._build_prompt(event, manifest, checkout_path)
 
-        # 3. 写入不确定提交边界，再让 Core 准入一个 detached ordinary Turn。
+        # 3. 先保存本地意图；相同 Message identity 的重试由 Core 验证正文相同。
+        input_message_id = _input_message_id(event)
         self._ledger.transition(
             event.event_key,
             expected=("context_ready",),
-            status="turn_submitting",
+            status="message_submitting",
             thread_id=session_id,
+            input_message_id=input_message_id,
         )
-        try:
-            receipt = await turns.submit(
-                session_id,
-                prompt,
-            )
-        except asyncio.CancelledError as exc:
-            raise ProgrammaticTurnUncertainError(
-                "programmatic Turn admission was cancelled after Core critical section"
-            ) from exc
-        receipt_session_id = getattr(receipt, "session_id", None)
-        turn_id = getattr(receipt, "turn_id", None)
-        if receipt_session_id != session_id:
-            raise ProgrammaticTurnUncertainError(
-                "programmatic Turn receipt returned mismatched Session identity"
-            )
-        if not isinstance(turn_id, str) or not turn_id:
-            raise ProgrammaticTurnUncertainError(
-                "programmatic Turn receipt returned invalid Turn identity"
-            )
+        accepted = await messages.submit(session_id, input_message_id, prompt)
+        if accepted != input_message_id:
+            raise RuntimeError("programmatic Message receipt identity mismatch")
         self._ledger.transition(
             event.event_key,
-            expected=("turn_submitting",),
+            expected=("message_submitting",),
             status="dispatched",
-            turn_id=turn_id,
+            input_message_id=input_message_id,
         )
         await self._ack_dispatched(event)
 
@@ -346,75 +329,6 @@ class GitHubWatch:
             logger.warning(
                 "github-watch ack reaction failed event=%s", event.event_key, exc_info=True
             )
-
-    async def _retry_pre_admission(
-        self,
-        event: EventState,
-        error: ProgrammaticTurnPreAdmissionError,
-    ) -> None:
-        current = self._ledger.get_event(event.event_key)
-        if current.status not in {"context_ready", "turn_submitting"}:
-            raise RuntimeError(
-                "pre-admission failure reached an unexpected event state: "
-                f"{event.event_key}={current.status}"
-            )
-        if error.reason == "session_provenance_mismatch":
-            if current.thread_id is None:
-                raise RuntimeError(
-                    "provenance mismatch 缺少待替换的 Session identity"
-                )
-            self._ledger.clear_thread(
-                event.repo,
-                event.kind,
-                event.number,
-                expected_thread_id=current.thread_id,
-            )
-            logger.warning(
-                "github-watch discarded stale programmatic Session event=%s session=%s",
-                event.event_key,
-                current.thread_id,
-            )
-        try:
-            await asyncio.to_thread(self._checkouts.cleanup, event.operation_id)
-        except OSError:
-            logger.warning(
-                "github-watch checkout cleanup deferred to TTL event=%s",
-                event.event_key,
-                exc_info=True,
-            )
-        self._ledger.transition(
-            event.event_key,
-            expected=(current.status,),
-            status="discovered",
-            error=repr(error),
-        )
-        logger.warning(
-            "github-watch pre-admission dispatch failure; retry next poll event=%s",
-            event.event_key,
-        )
-
-    def _mark_manual_reconcile(
-        self,
-        event: EventState,
-        error: ProgrammaticTurnUncertainError,
-    ) -> None:
-        current = self._ledger.get_event(event.event_key)
-        if current.status != "turn_submitting":
-            raise RuntimeError(
-                "uncertain Turn admission reached an unexpected event state: "
-                f"{event.event_key}={current.status}"
-            )
-        self._ledger.transition(
-            event.event_key,
-            expected=("turn_submitting",),
-            status="manual_reconcile",
-            error=repr(error),
-        )
-        logger.error(
-            "github-watch Turn admission uncertain; manual reconcile required "
-            "event=%s",
-            event.event_key,
-        )
 
     def _build_prompt(
         self,
@@ -445,7 +359,7 @@ class GitHubWatch:
             "keyword，并在正文说明它 supersedes 当前 PR。"
         )
         notification = self._notification_prompt()
-        return f"""[github-watch fire-and-forget]
+        return f"""[github-watch programmatic message]
 仓库: {event.repo}
 对象: {event.kind} #{event.number}
 触发: {event.trigger_kind} {event.trigger_id}
@@ -453,7 +367,7 @@ class GitHubWatch:
 证据清单: {manifest}
 临时仓库: {checkout_path}
 
-你处在这个 Issue/PR 的稳定专用 thread 中，上一次评论和完整历史都在该 thread 与本次证据包中。
+你处在这个 Issue/PR 的稳定专用 Session 中，上一次评论和完整历史都在该 Session 与本次证据包中。
 先读 manifest 和全部证据，再只在临时仓库中读取、测试或修改，以新鲜 GitHub 证据为准。{permission}
 禁止使用系统 gh、个人 GitHub 凭证或直接 git push；所有 GitHub 写操作必须使用 github_watch_* 工具，
 这些工具会绑定当前 operation、仓库和 Bot installation identity。{delivery}
@@ -461,8 +375,8 @@ class GitHubWatch:
 {notification}
 工具会自动添加并检查 operation marker，不要自行写 marker。若明确获准修改并创建 PR，先在临时仓库
 完成并提交改动，再调用 github_watch_push_branch，最后调用 github_watch_create_pr。
-插件不会等待或代发最终回复；GitHub 写操作失败时让本轮明确失败，不要伪装成功。临时仓库由宿主在
-本轮 after-turn 后删除，崩溃遗留由下一轮 TTL sweeper 回收。"""
+插件不会等待或代发最终回复；GitHub 写操作失败时让本轮明确失败，不要伪装成功。临时仓库在
+对应 Message 工作单元终结后删除，崩溃遗留由下一轮 TTL sweeper 回收。"""
 
     def _notification_prompt(self) -> str:
         """生成当前 turn 的窄范围选择性通知合同。"""

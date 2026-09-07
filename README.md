@@ -1,40 +1,34 @@
 # github-watch
 
-Akashic API v3 组合插件，不使用 webhook。
+Akashic API v3 插件。它轮询 GitHub，把可处理事件作为 programmatic Input Message 送入 Akashic，并提供受 operation 约束的 GitHub Tool。
 
 ## 行为
 
-- 首次启用只建立基线，不处理已有 Issue/PR。
-- 只轮询 open Issue 和 open PR；关闭或已合并对象不进入 baseline，也不再追踪。
-- 默认每 120 秒由 Core background job 检查一次；ETag 减少重复列表传输，稳定事件键和 SQLite 账本避免重复处理。
-- 基线后新建的 Issue/PR 只触发一次 programmatic turn；PR 默认提交一次 `COMMENT` review。
-- commit、状态、编辑和普通 comment 不唤醒。
-- 只有仓库 owner 新发的、包含 `@akashic-review-bot` 的 comment 可以再次唤醒。
-- 每个 Issue/PR 通过 invocation-scoped programmatic Turn port 复用同一 Session；每次都会生成新的完整证据包。
-- 插件只等 `turn/start` 入队成功，不等待 turn 完成，也不接收或代发最终回复。
-- 每个仓库复用 `plugin-data` 下不含凭证的裸镜像；每次 turn 以 detached commit 创建唯一
-  operation worktree。typed TurnCommitted 事件删除工作目录，异常退出由 TTL sweeper 和
-  worktree prune 回收。
-- `github_watch_runtime_info` 只读返回当前插件版本和 checkout 恢复策略，供正式候选验证使用。
-- Agent 默认只分析，并通过 `github_watch_*` 工具以 GitHub App Bot 身份发布 comment/review。
-  只有 owner mention 明确要求修改或创建 PR 时，才允许在临时仓库提交、push 和创建 PR。
-- 从 Issue 创建的修复 PR 必须使用 `Fixes #<issue>` 关联并在合入后自动关闭 Issue；每个 Issue
-  修复链默认只创建一个 PR。PR 上的后续修改默认不得递归另开替代 PR，工具无法更新当前 PR
-  时必须在原 PR 说明阻塞；只有 owner 明确要求时才能另开并声明 supersedes 关系。
-- 配置主 channel 后，Agent 只在需要维护者决策、出现关键阻塞/风险，或非常值得立即告知时
-  选择性调用一次 `message_push`；普通成功、常规 review 和过程进度不推送。
+- 首次启用只为 open Issue/PR 建立静默基线。
+- 基线后新建的 open Issue/PR、draft PR 转为 ready，以及仓库 owner 新发且包含配置 mention 的 comment 会产生稳定事件；commit、编辑、普通 comment、关闭和合并不会唤醒。
+- 同一 Issue/PR 复用一个确定性 programmatic Session；每个事件使用由 `operation_id` 推导的确定性 Input Message ID。提交返回即结束轮询，不等待模型输出。
+- SQLite 账本持久化事件、operation、Session 和 Input Message identity。进程若在 Message 提交期间退出，启动后用相同 ID 重试，由 Core 的 append 幂等边界消除重复输入。
+- 每个事件构建一份证据包和 detached operation checkout。Message 投影达到终态后删除该 checkout；异常退出由 TTL sweeper 与 worktree prune 回收。
+- Agent 默认只分析。写操作必须由该 programmatic Input 的真实 Tool execution 发起，并携带对应 `operation_id`。只有 owner mention 事件可以 push 或创建 PR。
+- comment、review 和 PR 使用 operation marker 查询去重。push 只允许一个 operation 分支，已记录的同名 push 可重复调用，换名会失败。
+- Issue 修复 PR 应用 `Fixes #<issue>` 关联原 Issue；PR 上的后续修改默认更新原 PR，不能把另开替代 PR 当作失败 fallback。
+- GET 使用分页、ETag 和传输 cooldown；写请求不自动重发。Git 凭据通过短命 `GIT_ASKPASS` 传入，remote、账本、证据和日志不保存 token。
+- 配置通知 channel 后，Agent 可在需要决策、关键阻塞或高价值提醒时调用 `message_push`；插件自身不代发模型结果。
 
-SQLite 账本记录 `event_key -> operation_id -> thread_id -> turn_id -> dispatched`。`turn/start`
-请求开始后的不确定失败不会自动重试，避免重复唤醒；App 写操作使用 operation marker 去重。
+插件只注入通用 `TIMERS`、`PROGRAMMATIC`、`MESSAGE_CATALOG`、`TURN_PROJECTION` 和 `TOOLS` 能力。候选 generation 的 `apply` 只登记生命周期和 Tool，不打开 PEM、数据库或网络；正式 Root 启动后才创建客户端、账本和后台循环。
 
-插件只注入 `core.background_jobs` 和 `core.tool_catalog`，并登记 `AFTER_TURN_COMMITTED`
-listener。Core 通过 `BackgroundJobContext.turns` 提供 invocation-scoped Session/Turn 准入；
-GitHub 客户端、SQLite、证据、checkout、幂等与重试仍由插件实现。
+## Tool
+
+- `github_watch_runtime_info`
+- `github_watch_post_comment`
+- `github_watch_submit_review`
+- `github_watch_push_branch`
+- `github_watch_create_pr`
 
 ## 配置
 
-复制 `config.example.toml` 为仓库外的私有配置，填入 GitHub App 的 app id、installation id、
-PEM 绝对路径和可选主 channel。私钥和 installation token 不会写入插件源码、账本或证据包。
+复制 `config.example.toml` 到安装后的私有配置目录，填写 GitHub App 的 app id、installation id、PEM 绝对路径、仓库列表和可选通知目标。私钥及 installation token 不写入账本或证据包。
 
-该版本要求包含 stable background-job snapshot scheduling、programmatic Turn admission、严格
-Tool catalog handler 校验与 typed TurnCommitted event 的 Akashic Core。
+```bash
+AKASHIC_AGENT_ROOT=/path/to/akasic-agent PYTHONPATH=/path/to/akasic-agent python -m pytest -q
+```
