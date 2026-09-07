@@ -51,7 +51,6 @@ def test_pr_bundle_contains_complete_views_and_verified_digests(tmp_path):
         "1",
         "claimed",
         None,
-        None,
     )
     manifest_path = ContextBundle(FakeGitHub(), tmp_path).build(event)  # type: ignore[arg-type]
     manifest = json.loads(manifest_path.read_text())

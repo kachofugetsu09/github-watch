@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from github_watch_test_package.checkout import CheckoutManager
+from github_watch_test_package.checkout import CheckoutManager, CheckoutState
 from github_watch_test_package.ledger import EventState
 
 
@@ -28,7 +28,6 @@ def event(*, kind: str = "pr") -> EventState:
         trigger_id="7",
         status="claimed",
         thread_id=None,
-        turn_id=None,
     )
 
 
@@ -127,6 +126,34 @@ def test_prepare_issue_detaches_exact_default_branch_head(
     )
 
 
+def test_push_reuses_recorded_branch_and_rejects_a_second_name(
+    tmp_path: Path, monkeypatch
+) -> None:
+    manager = CheckoutManager(
+        FakeClient(), root=tmp_path / "checkouts", mirror_root=tmp_path / "mirror"
+    )  # type: ignore[arg-type]
+    operation_dir = tmp_path / "checkouts" / ("a" * 32)
+    repository = operation_dir / "repository"
+    (repository / ".git").mkdir(parents=True)
+    manager._write_state(  # noqa: SLF001 - verifies the durable retry boundary
+        CheckoutState(
+            "a" * 32, "owner/repo", repository, "base", "akashic/aaaaaaaaaaaa-fix"
+        )
+    )
+    monkeypatch.setattr(
+        manager,
+        "_git_output",
+        lambda _repository, *arguments: "" if arguments[0] == "status" else "head",
+    )
+    calls: list[list[str]] = []
+    monkeypatch.setattr(manager, "_run_authenticated", lambda _root, command: calls.append(command))
+
+    assert manager.push("a" * 32, "fix") == "akashic/aaaaaaaaaaaa-fix"
+    assert calls == []
+    with pytest.raises(RuntimeError, match="different branch"):
+        manager.push("a" * 32, "other")
+
+
 def test_mirror_is_cloned_once_and_reused(tmp_path: Path, monkeypatch) -> None:
     manager = CheckoutManager(
         FakeClient(),
@@ -164,7 +191,6 @@ def test_mirror_is_cloned_once_and_reused(tmp_path: Path, monkeypatch) -> None:
         trigger_id="7",
         status="claimed",
         thread_id=None,
-        turn_id=None,
     )
     manager.prepare(second, {"head": {"sha": "deadbeef"}})
 

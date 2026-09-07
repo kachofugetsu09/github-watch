@@ -173,6 +173,10 @@ class CheckoutManager:
         if head == state.base_sha:
             raise RuntimeError("checkout has no committed changes")
         branch = f"akashic/{operation_id[:12]}-{branch_suffix}"
+        if state.pushed_branch is not None:
+            if state.pushed_branch != branch:
+                raise RuntimeError("operation already pushed a different branch")
+            return branch
         self._run_authenticated(
             state.path.parent,
             [

@@ -1,131 +1,30 @@
-# GitHub Watch 轮询设计
+# GitHub Watch Message runtime design
 
-## 目标语义
-
-- 不使用 webhook；由 Akashic Plugin API v3 的 stable snapshot Timer 串行轮询。
-- 只列出 open Issue 和 open PR；关闭或已合并对象不进入首次 baseline 和后续轮询。
-- 首次启用只建立 baseline，不回复已有 Issue/PR。
-- baseline 后的新 Issue/PR 只唤醒一次，默认只分析并 comment。
-- commit、label、state、普通 comment 和 comment edit 不唤醒。
-- 只有 repository owner 新发的 `@akashic-review-bot` comment 可以再唤醒。
-- owner mention 默认仍只 comment；它明确要求修改或创建 PR 时，程序化 Agent 才可使用本地 Shell 执行。
-- Issue 触发的修复 PR 正文必须写 `Fixes #<issue>`，使默认分支合入自动关闭对应 Issue；同一
-  Issue 修复链默认只创建一个 PR。PR 上的修改请求不得把另开 PR 当作 fallback；无法更新当前
-  PR 时在原 PR 暴露阻塞，只有 owner 明确要求替代 PR 时才创建并声明 closing/supersedes 关系。
-
-## 所有权和流程
+## 主链
 
 ```text
-┌──────────────────────┐
-│ GitHub authority     │  Issue/PR/comment/owner
-└──────────┬───────────┘
-           ▼
-┌──────────────────────┐
-│ Conditional poll     │  stable sort + Link + ETag
-└──────────┬───────────┘
-           ▼
-┌──────────────────────┐
-│ SQLite event ledger  │  event/operation/thread/turn/artifact
-└──────────┬───────────┘
-           ▼
-┌──────────────────────┐
-│ Evidence + checkout  │  full pages + persistent mirror + detached commit
-└──────────┬───────────┘
-           ▼
-┌──────────────────────┐
-│ Stable Agent Session │  fresh programmatic Turn per allowed event
-└──────────┬───────────┘
-           ▼
-┌──────────────────────┐
-│ Fire-and-forget turn │  return after programmatic Turn admission
-└──────────┬───────────┘
-           ▼
-┌──────────────────────┐
-│ App-owned effect     │  Bot comment/review/branch/PR + dedupe
-└──────────────────────┘
+GitHub poll ──> plugin ledger ──> evidence + checkout
+                                      │
+                                      ▼
+                            deterministic Input Message
+                                      │
+                                      ▼
+                         ordinary react / Tool execution
+                                      │
+                                      ▼
+                    Message terminal projection ──> cleanup
 ```
 
-GitHub 保存远程权威事实；`events.sqlite3` 保存消费和恢复事实；Akashic
-`sessions.db` 只追加稳定 Session 与 Turn 消息。Session metadata 关闭 memory retrieval 和
-post-memory，避免 GitHub 任务进入长期记忆。每个仓库在 `plugin-data` 中复用裸镜像，每个
-operation 从精确提交创建唯一 detached worktree；typed TurnCommitted 按 Core Turn ID 找回并删除，
-进程中断时由轮询 TTL 清扫工作目录，并在下次 fetch 前 prune 已失效的 worktree 管理记录。
+Core 拥有 Message append、Session 准入、Turn 投影、Tool execution 和 generation lifecycle。插件拥有 GitHub 发现规则、事件与 operation identity、证据、checkout、GitHub App 写操作及其恢复。两边只通过通用组合能力连接；Core 不识别 GitHub Watch 的事件或状态机。
 
-配置通知目标时，prompt 允许 Agent 在需要维护者决策、关键阻塞/风险或极重要结果时，向固定主
-channel 调用一次 `message_push`。通知不取代 GitHub comment/review，不等待主 channel 回复；普通
-成功、常规 review 和过程进度保持静默。未配置通知目标时 prompt 明确禁止 `message_push`。
+## 状态和恢复
 
-## 事件与恢复
+SQLite 的事件状态依次为 `discovered -> claimed -> context_ready -> message_submitting -> dispatched -> completed`。`message_submitting` 保存确定性 Session 与 Input Message ID；启动恢复把它退回 `discovered` 并以相同 ID 重试。Core 接受相同 Message 后返回同一 identity，因此提交结果丢失不会生成第二条输入。旧 `turn_submitting` 行无法证明 Message identity，启动时保留为需人工核对的状态。
 
-稳定事件键：
+每个 operation checkout 从远端精确 commit 创建。插件只会删除通过 operation ID 验证的目录；正常删除由已提交 Input 所属投影的终态触发，长期遗留由 TTL sweeper 回收。远端写操作不随内存或 checkout 回滚。comment、review 和 PR 先查 operation marker；push 把一个 operation 永久绑定到一个分支名。
 
-- `repo:issue:number:opened`
-- `repo:pr:number:opened`
-- `repo:kind:number:comment:comment_id`
+## Tool 授权
 
-`updated_at` 只是“需要检查 comment cursor”的候选信号，不是执行身份。编辑原
-comment 不改变 `comment_id`，因此不会重复事件。
+Tool `prepare` 从不可变 `CallSource.messages` 取得 Session，要求其中包含账本记录的原始 programmatic Input，并核对 `operation_id -> session_id`。push 与 create PR 还要求事件来自 owner mention。参数在这一边界用严格 schema 校验；通过后不再重复猜测来源。
 
-```text
-discovered → claimed → context_ready → turn_submitting → dispatched
-```
-
-- `claimed/context_ready` 在重启后可安全回到 `discovered`，因为 turn 尚未提交。
-- `turn_submitting` 中断后转为 `manual_reconcile`，不自动重试。
-- programmatic Turn 返回 identity 后立即进入终态 `dispatched`；插件不等待 Turn 完成。
-- Agent 自行发送 comment，发送前检查稳定 operation marker，已有则不重复发送。
-- 带 operation marker 的 comment 永不触发 owner mention，避免 owner 凭证发送时形成自激循环。
-
-## 上下文和凭证
-
-每次唤醒在 `plugin-data/evidence/<operation-id>/` 重新抓取 item、timeline、Issue
-comments；PR 额外包含 commits、files、reviews、review comments、checks、combined status
-和 GitHub diff media type 的完整 patch。`manifest.json` 记录每个文件的字节数、对象数和
-SHA-256。稳定 thread 提供旧对话，新 evidence 始终覆盖旧事实。
-
-GitHub App 私钥只由仓库外的绝对路径引用，installation token 只驻留内存。clone/push
-通过短命 `GIT_ASKPASS` 和禁用全局 credential helper 的子进程执行，remote URL 不含 token。
-comment、COMMENT review 和创建 PR 均调用 App REST API。源码、prompt、SQLite、evidence、
-Git remote 和日志都不写入凭证。
-
-## 轮询实践
-
-请求使用认证、默认 120 秒周期、稳定排序和 Core Timer 串行调度。稳定事件键和 SQLite 账本阻止同一
-Issue/PR 被重复处理；列表仍会按周期检查，但每页保留 ETag 并发送 `If-None-Match`，
-`304` 复用已验证页。`Retry-After` 或 rate-limit reset 存在时，客户端在本地阻断新 HTTP
-请求直到恢复时间。
-
-GET 和短命 installation token 交换遇到短暂 TLS、连接或不完整响应时最多尝试三次；仍失败
-则进入五分钟传输冷却，避免后台任务每轮制造重复请求和完整异常栈。恢复后的首个 HTTP 响应
-记录一次恢复日志。comment、review 等业务写请求保持单次发送，传输结果不确定时绝不自动重试。
-
-## v3 组合所有权
-
-```text
-┌──────────────────┐  core.background_jobs ┌────────────────────┐
-│ GitHub Watch     │ ◀──────────────── │ stable snapshot    │
-│ polling + ledger │                   │ cadence + coalesce │
-└────────┬─────────┘                   └────────────────────┘
-         │ BackgroundJobContext.turns
-         ▼
-┌──────────────────┐  core.background_jobs ┌────────────────────┐
-│ domain dispatch  │ ───────────────────▶ │ Session/Turn owner │
-└────────┬─────────┘                   └────────────────────┘
-         │ TOOL_CATALOG descriptors + typed TurnCommitted listener
-         ▼
-┌──────────────────┐                   ┌────────────────────────┐
-│ GitHub/checkout  │                   │ core.tool_catalog/events│
-│ SQLite/evidence  │                   │ registry + timing      │
-└──────────────────┘                   └────────────────────────┘
-```
-
-插件不取得 Core control plane、Session store 或 job host。`BackgroundJobContext.turns` 只接受
-创建 invocation-scoped Session 与提交普通输入；Core 负责生成不可伪造的 Session/Turn receipt。
-Tool 的 operation/thread 绑定仍由 SQLite event identity 与 Core 提供的不可变 Tool execution
-context 双重确定，不再重复读取可变 Session metadata。
-
-参考：
-
-- <https://docs.github.com/en/rest/using-the-rest-api/best-practices-for-using-the-rest-api>
-- <https://docs.github.com/en/rest/using-the-rest-api/using-pagination-in-the-rest-api>
-- <https://docs.github.com/en/apps/creating-github-apps/registering-a-github-app/choosing-permissions-for-a-github-app>
+候选 `apply` 无外部效果。正式 `RUNTIME_STARTED` 打开插件状态并启动两个 Fiber：Timer 驱动的 poll loop，以及 Message catalog head 驱动的 cleanup loop。`RUNTIME_STOPPING` 取消同一 generation 的任务，避免热更新后继续使用旧 Root。

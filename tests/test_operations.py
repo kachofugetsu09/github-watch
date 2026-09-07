@@ -19,7 +19,6 @@ def event(*, kind: str = "issue") -> EventState:
         trigger_id="7",
         status="dispatched",
         thread_id="programmatic:one",
-        turn_id="turn:one",
     )
 
 
