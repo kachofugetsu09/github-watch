@@ -70,7 +70,7 @@ class EventLedger:
                                   error = 'runtime interrupted after external effect began'
                 WHERE status IN (
                     'turn_running', 'turn_submitting', 'comment_posting'
-                )
+                ) OR (status = 'dispatched' AND input_message_id IS NULL)
                 """,
                 (utc_now(),),
             ).rowcount
@@ -303,29 +303,25 @@ class EventLedger:
 
     def pending_events(self) -> list[EventState]:
         with self._connect() as connection:
-            rows = connection.execute(
-                """
+            rows = connection.execute("""
                 SELECT event_key, operation_id, repo, kind, number,
                        trigger_kind, trigger_id, status, thread_id, turn_id,
                        input_message_id
                 FROM events WHERE status = 'discovered'
                 ORDER BY created_at, event_key
-                """
-            ).fetchall()
+                """).fetchall()
         return [EventState(*row) for row in rows]
 
     def dispatched_events(self) -> list[EventState]:
         """返回等待 Message 终态与 checkout 清理的当前事件。"""
         with self._connect() as connection:
-            rows = connection.execute(
-                """
+            rows = connection.execute("""
                 SELECT event_key, operation_id, repo, kind, number,
                        trigger_kind, trigger_id, status, thread_id, turn_id,
                        input_message_id
                 FROM events WHERE status = 'dispatched'
                 ORDER BY created_at, event_key
-                """
-            ).fetchall()
+                """).fetchall()
         return [EventState(*row) for row in rows]
 
     def transition(
@@ -373,8 +369,7 @@ class EventLedger:
 
     def _initialize(self) -> None:
         with self._connect() as connection:
-            connection.executescript(
-                """
+            connection.executescript("""
                 PRAGMA journal_mode = WAL;
                 PRAGMA foreign_keys = ON;
                 CREATE TABLE IF NOT EXISTS meta(
@@ -413,14 +408,11 @@ class EventLedger:
                     FOREIGN KEY(repo, kind, number)
                         REFERENCES items(repo, kind, number)
                 );
-                """
-            )
+                """)
             self._migrate(connection)
 
     def _migrate(self, connection: sqlite3.Connection) -> None:
-        columns = {
-            row[1] for row in connection.execute("PRAGMA table_info(items)")
-        }
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(items)")}
         if "draft" not in columns:
             connection.execute(
                 "ALTER TABLE items ADD COLUMN draft INTEGER NOT NULL DEFAULT 0"

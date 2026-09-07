@@ -91,8 +91,44 @@ def test_event_can_be_resolved_by_operation_and_turn_identity(tmp_path):
         turn_id="turn:one",
     )
 
-    assert ledger.get_event_by_operation(event.operation_id).event_key == event.event_key
+    assert (
+        ledger.get_event_by_operation(event.operation_id).event_key == event.event_key
+    )
     resolved = ledger.get_event_by_turn("turn:one")
     assert resolved is not None
     assert resolved.operation_id == event.operation_id
     assert ledger.get_event_by_turn("turn:missing") is None
+
+
+def test_legacy_dispatched_event_keeps_evidence_without_replay(tmp_path):
+    ledger = EventLedger(tmp_path / "events.sqlite3")
+    for number, message_id in ((1, None), (2, "input:new")):
+        assert ledger.insert_item("owner/repo", "issue", number, "t1", 0)
+        event = ledger.create_event(
+            event_key=f"owner/repo:issue:{number}:opened",
+            repo="owner/repo",
+            kind="issue",
+            number=number,
+            trigger_kind="opened",
+            trigger_id=str(number),
+        )
+        ledger.transition(
+            event.event_key,
+            expected=("discovered",),
+            status="dispatched",
+            thread_id=f"thread:{number}",
+            turn_id=f"turn:{number}",
+            input_message_id=message_id,
+        )
+    assert ledger.recover_interrupted() == {
+        "safe_requeued": 0,
+        "manual_reconcile": 1,
+    }
+    old = ledger.get_event("owner/repo:issue:1:opened")
+    assert old.status == "manual_reconcile"
+    assert (old.thread_id, old.turn_id) == ("thread:1", "turn:1")
+    assert ledger.get_event("owner/repo:issue:2:opened").status == "dispatched"
+    assert ledger.recover_interrupted() == {
+        "safe_requeued": 0,
+        "manual_reconcile": 0,
+    }
