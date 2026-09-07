@@ -73,7 +73,6 @@ def test_dispatch_admits_stable_session_and_exact_input_message(tmp_path: Path) 
     assert saved.status == "dispatched"
     assert saved.thread_id == expected_session
     assert saved.input_message_id == expected_input
-    assert saved.turn_id is None
 
 
 def test_next_event_reuses_session_and_gets_distinct_input(tmp_path: Path) -> None:

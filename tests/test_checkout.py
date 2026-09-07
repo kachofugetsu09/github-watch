@@ -28,7 +28,6 @@ def event(*, kind: str = "pr") -> EventState:
         trigger_id="7",
         status="claimed",
         thread_id=None,
-        turn_id=None,
     )
 
 
@@ -192,7 +191,6 @@ def test_mirror_is_cloned_once_and_reused(tmp_path: Path, monkeypatch) -> None:
         trigger_id="7",
         status="claimed",
         thread_id=None,
-        turn_id=None,
     )
     manager.prepare(second, {"head": {"sha": "deadbeef"}})
 

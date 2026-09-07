@@ -29,6 +29,15 @@ Akashic API v3 插件。它轮询 GitHub，把可处理事件作为 programmatic
 
 复制 `config.example.toml` 到安装后的私有配置目录，填写 GitHub App 的 app id、installation id、PEM 绝对路径、仓库列表和可选通知目标。私钥及 installation token 不写入账本或证据包。
 
+从 3.x 升级到 4.0.0 时，先停止 runtime，再显式删除已经失效的 Turn 超时配置：
+
+```bash
+python scripts/migrate_message_runtime_config.py \
+  <workspace>/plugin-data/github-watch-github/config.local.toml
+```
+
+脚本保留同目录 `config.local.toml.before-message-runtime` 恢复副本并输出 hash receipt；新 runtime 不读取或兼容 `turn_timeout_seconds`。
+
 ```bash
 AKASHIC_AGENT_ROOT=/path/to/akasic-agent PYTHONPATH=/path/to/akasic-agent python -m pytest -q
 ```

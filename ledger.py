@@ -35,7 +35,6 @@ class EventState:
     trigger_id: str
     status: str
     thread_id: str | None
-    turn_id: str | None
     input_message_id: str | None = None
 
 
@@ -263,8 +262,7 @@ class EventLedger:
             row = connection.execute(
                 """
                 SELECT event_key, operation_id, repo, kind, number,
-                       trigger_kind, trigger_id, status, thread_id, turn_id,
-                       input_message_id
+                       trigger_kind, trigger_id, status, thread_id, input_message_id
                 FROM events WHERE event_key = ?
                 """,
                 (event_key,),
@@ -278,8 +276,7 @@ class EventLedger:
             row = connection.execute(
                 """
                 SELECT event_key, operation_id, repo, kind, number,
-                       trigger_kind, trigger_id, status, thread_id, turn_id,
-                       input_message_id
+                       trigger_kind, trigger_id, status, thread_id, input_message_id
                 FROM events WHERE operation_id = ?
                 """,
                 (operation_id,),
@@ -288,25 +285,11 @@ class EventLedger:
             raise KeyError(operation_id)
         return EventState(*row)
 
-    def get_event_by_turn(self, turn_id: str) -> EventState | None:
-        with self._connect() as connection:
-            row = connection.execute(
-                """
-                SELECT event_key, operation_id, repo, kind, number,
-                       trigger_kind, trigger_id, status, thread_id, turn_id,
-                       input_message_id
-                FROM events WHERE turn_id = ?
-                """,
-                (turn_id,),
-            ).fetchone()
-        return EventState(*row) if row is not None else None
-
     def pending_events(self) -> list[EventState]:
         with self._connect() as connection:
             rows = connection.execute("""
                 SELECT event_key, operation_id, repo, kind, number,
-                       trigger_kind, trigger_id, status, thread_id, turn_id,
-                       input_message_id
+                       trigger_kind, trigger_id, status, thread_id, input_message_id
                 FROM events WHERE status = 'discovered'
                 ORDER BY created_at, event_key
                 """).fetchall()
@@ -317,8 +300,7 @@ class EventLedger:
         with self._connect() as connection:
             rows = connection.execute("""
                 SELECT event_key, operation_id, repo, kind, number,
-                       trigger_kind, trigger_id, status, thread_id, turn_id,
-                       input_message_id
+                       trigger_kind, trigger_id, status, thread_id, input_message_id
                 FROM events WHERE status = 'dispatched'
                 ORDER BY created_at, event_key
                 """).fetchall()
@@ -331,7 +313,6 @@ class EventLedger:
         expected: tuple[str, ...],
         status: str,
         thread_id: str | None = None,
-        turn_id: str | None = None,
         input_message_id: str | None = None,
         response: str | None = None,
         artifact_id: str | None = None,
@@ -341,7 +322,6 @@ class EventLedger:
         values: list[object] = [status, utc_now()]
         for column, value in (
             ("thread_id", thread_id),
-            ("turn_id", turn_id),
             ("input_message_id", input_message_id),
             ("response", response),
             ("artifact_id", artifact_id),
