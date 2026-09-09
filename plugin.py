@@ -15,12 +15,12 @@ from typing import Literal, cast
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 from agent.control.timer import TimerStatus
-from agent.plugin_composition import Context, RUNTIME_STARTED, RUNTIME_STOPPING
+from agent.plugin_composition import Context, RUNTIME_STARTED, RUNTIME_STOPPING, ServiceKey
 from agent.plugin_composition.messages import MESSAGE_CATALOG
 from agent.plugin_composition.timers import TIMERS
 from plugins.programmatic.control import AdmitParams, PROGRAMMATIC, Programmatic, SendParams
 from plugins.tools.api import BoundTool, CallSource, InvalidArguments, Result
-from plugins.tools.plugin import TOOLS
+from plugins.tools.plugin import TOOLS, ToolView
 from plugins.turn_projection.plugin import TURN_PROJECTION, TurnProjection
 from session.log import MessageCatalog
 from session.message import ContentPart, Input
@@ -328,20 +328,27 @@ Config = GitHubWatchConfig
 inject = (TIMERS, PROGRAMMATIC, MESSAGE_CATALOG, TURN_PROJECTION, TOOLS)
 
 
+GITHUB_WATCH_TOOLS = ServiceKey[ToolView]("github-watch.tools.v1")
+
+
 async def apply(ctx: Context, config: GitHubWatchConfig) -> None:
     """注册普通 Tool 与生命周期；候选 Root 不打开 PEM、数据库或网络。"""
     runtime = Runtime(ctx, config)
+    catalog = ctx.require(TOOLS)
+    await catalog.declare_group(ctx, always_on=True, description=desc)
+    refs = []
     for tool_name, description, parameters, action in _definitions():
         @asynccontextmanager
         async def open_tool(_state: Mapping[str, object], action: str = action) -> AsyncGenerator[GitHubTool]:
             yield GitHubTool(runtime, action)
 
-        _ = await ctx.require(TOOLS).register(
+        refs.append(await catalog.register(
             ctx, name=tool_name, description=description, parameters=parameters,
             open=open_tool, idempotent=True,
             risk="read-only" if action == "runtime_info" else "external-side-effect",
-            always_on=True,
-        )
+        ))
+
+    await ctx.provide(GITHUB_WATCH_TOOLS, catalog.view(*refs))
 
     watcher: asyncio.Task[None] | None = None
 

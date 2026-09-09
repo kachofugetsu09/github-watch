@@ -20,7 +20,7 @@ from agent.plugins.snapshot import lease_runtime_snapshot
 from plugins.content.plugin import check_text
 from plugins.programmatic.control import AdmitParams, PROGRAMMATIC, SendParams
 from plugins.tools.api import MessageReply, result_message_id
-from plugins.tools.plugin import TOOLS
+from plugins.tools.plugin import TOOLS, ALL_TOOLS
 from session.message import CallRef, ContentPart, Output, ToolCall, ToolResult
 from tests.test_default_reply import application
 
@@ -194,7 +194,7 @@ async def test_real_manager_message_tool_db_and_restart_use_local_github_endpoin
             bindings = Bindings(log, host._archive, host.open_binding)
             async with lease_runtime_snapshot(host.snapshot_store) as snapshot:
                 catalog = snapshot.composition_root.context.require(TOOLS)
-                binding = catalog.bind("github_watch_post_comment", bindings)
+                binding = catalog.bind(snapshot.composition_root.context.require(ALL_TOOLS)().select("github_watch_post_comment"), bindings)
                 call_writer = log.writer(
                     session_id, author="assistant", source="programmatic",
                     body_types=(Output,), content={}, check_call=lambda _call: None,
