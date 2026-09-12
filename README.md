@@ -11,10 +11,11 @@ Akashic API v3 组合插件，不使用 webhook。
 - commit、状态、编辑和普通 comment 不唤醒。
 - 只有仓库 owner 新发的、包含 `@akashic-review-bot` 的 comment 可以再次唤醒。
 - 每个 Issue/PR 通过 invocation-scoped programmatic Turn port 复用同一 Session；每次都会生成新的完整证据包。
-- 插件只等 `turn/start` 入队成功，不等待 turn 完成，也不接收或代发最终回复。
+- 插件先保存 `programmatic/message/send` 返回的真实 Input `message_id`，轮询时再用
+  `programmatic/message/result` 读取同一 Input 的 Turn 投影；`complete` 后才清理 checkout，
+  `pause/failure` 保留 `manual_reconcile`，不接收或代发最终回复。
 - 每个仓库复用 `plugin-data` 下不含凭证的裸镜像；每次 turn 以 detached commit 创建唯一
-  operation worktree。typed TurnCommitted 事件删除工作目录，异常退出由 TTL sweeper 和
-  worktree prune 回收。
+  operation worktree。结果读取失败或进程异常由 TTL sweeper 和 worktree prune 回收。
 - `github_watch_runtime_info` 只读返回当前插件版本和 checkout 恢复策略，供正式候选验证使用。
 - Agent 默认只分析，并通过 `github_watch_*` 工具以 GitHub App Bot 身份发布 comment/review。
   只有 owner mention 明确要求修改或创建 PR 时，才允许在临时仓库提交、push 和创建 PR。
@@ -24,11 +25,12 @@ Akashic API v3 组合插件，不使用 webhook。
 - 配置主 channel 后，Agent 只在需要维护者决策、出现关键阻塞/风险，或非常值得立即告知时
   选择性调用一次 `message_push`；普通成功、常规 review 和过程进度不推送。
 
-SQLite 账本记录 `event_key -> operation_id -> thread_id -> turn_id -> dispatched`。`turn/start`
-请求开始后的不确定失败不会自动重试，避免重复唤醒；App 写操作使用 operation marker 去重。
+SQLite 账本记录 `event_key -> operation_id -> thread_id -> input_id -> dispatched/completed`。
+`message/send` 请求开始后的不确定失败不会自动重试，避免重复唤醒；App 写操作使用 operation
+marker 去重。
 
-插件只注入 `core.timers`、`programmatic.v1` 和 `tools.v1`，并登记 `AFTER_TURN_COMMITTED`
-listener。Core 通过 `programmatic.v1` 提供 invocation-scoped Session/Turn 准入；
+插件只注入 `core.timers`、`programmatic.v1` 和 `tools.v1`。Core 通过
+`programmatic.v1` 提供 invocation-scoped Session/Input 准入与按 Input 查询的 Turn 投影；
 GitHub 客户端、SQLite、证据、checkout、幂等与重试仍由插件实现。
 
 ## 配置
@@ -36,5 +38,5 @@ GitHub 客户端、SQLite、证据、checkout、幂等与重试仍由插件实�
 复制 `config.example.toml` 为仓库外的私有配置，填入 GitHub App 的 app id、installation id、
 PEM 绝对路径和可选主 channel。私钥和 installation token 不会写入插件源码、账本或证据包。
 
-该版本要求包含 stable Timer snapshot scheduling、programmatic Turn admission、严格
-`tools.v1` provider 校验与 typed TurnCommitted event 的 Akashic Core。
+该版本要求包含 stable Timer snapshot scheduling、programmatic Message admission/result、严格
+`tools.v1` provider 校验的 Akashic Core。

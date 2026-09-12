@@ -17,7 +17,7 @@ class ProgrammaticTurnPreAdmissionError(RuntimeError):
 
 
 class ProgrammaticTurnUncertainError(RuntimeError):
-    """The programmatic provider did not return a durable turn receipt."""
+    """The programmatic provider did not return a durable Message receipt."""
 
 from .context_bundle import ContextBundle
 from .checkout import CheckoutManager
@@ -33,11 +33,13 @@ logger = logging.getLogger("plugin.github-watch")
 
 
 class ProgrammaticTurnPort(Protocol):
-    """Submit one invocation-scoped programmatic Turn without Core control access."""
+    """Submit and observe one invocation-scoped programmatic Input."""
 
     async def create_session(self, *, metadata: Mapping[str, object]) -> str: ...
 
     async def submit(self, session_id: str, content: str) -> object: ...
+
+    async def result(self, session_id: str, input_id: str) -> Mapping[str, object]: ...
 
 
 class GitHubWatch:
@@ -106,6 +108,10 @@ class GitHubWatch:
         # 3. Run only durable events that have never begun an external effect
         for event in self._ledger.pending_events():
             await self._process_event(event, turns)
+
+        # 4. Admission is detached, but cleanup follows the same Message/Turn
+        # projection instead of guessing a Core Turn identity.
+        await self._reconcile_dispatched(turns)
 
     def _discover_repository(self, repo: str) -> None:
         """Classify fresh GitHub state without treating updated_at as a wake signal."""
@@ -269,10 +275,10 @@ class GitHubWatch:
             self._mark_manual_reconcile(event, exc)
             return
         logger.info(
-            "github-watch dispatched event=%s thread=%s turn=%s",
+            "github-watch dispatched event=%s session=%s input=%s",
             event.event_key,
             self._ledger.get_event(event.event_key).thread_id,
-            self._ledger.get_event(event.event_key).turn_id,
+            self._ledger.get_event(event.event_key).input_id,
         )
 
     async def _dispatch_turn(
@@ -322,22 +328,65 @@ class GitHubWatch:
                 "programmatic Turn admission was cancelled after Core critical section"
             ) from exc
         receipt_session_id = getattr(receipt, "session_id", None)
-        turn_id = getattr(receipt, "turn_id", None)
+        input_id = getattr(receipt, "input_id", None)
         if receipt_session_id != session_id:
             raise ProgrammaticTurnUncertainError(
-                "programmatic Turn receipt returned mismatched Session identity"
+                "programmatic Message receipt returned mismatched Session identity"
             )
-        if not isinstance(turn_id, str) or not turn_id:
+        if not isinstance(input_id, str) or not input_id:
             raise ProgrammaticTurnUncertainError(
-                "programmatic Turn receipt returned invalid Turn identity"
+                "programmatic Message receipt returned invalid Input identity"
             )
         self._ledger.transition(
             event.event_key,
             expected=("turn_submitting",),
             status="dispatched",
-            turn_id=turn_id,
+            input_id=input_id,
         )
         await self._ack_dispatched(event)
+
+    async def _reconcile_dispatched(self, turns: ProgrammaticTurnPort) -> None:
+        """Read terminal results and clean only the matching completed operation."""
+        for event in self._ledger.dispatched_events():
+            input_id = event.input_id
+            if event.thread_id is None or input_id is None:
+                # Historical rows have no accepted Input identity; TTL recovery
+                # remains their only safe cleanup path.
+                continue
+            result = await turns.result(event.thread_id, input_id)
+            status = result["status"]
+            encoded = json.dumps(dict(result), ensure_ascii=False, sort_keys=True)
+            if status == "open":
+                continue
+            if status != "complete":
+                self._ledger.transition(
+                    event.event_key,
+                    expected=("dispatched",),
+                    status="manual_reconcile",
+                    response=encoded,
+                    error=f"programmatic Input ended with status={status}",
+                )
+                logger.error(
+                    "github-watch programmatic result needs manual reconcile "
+                    "event=%s status=%s",
+                    event.event_key,
+                    status,
+                )
+                continue
+            try:
+                await asyncio.to_thread(self._checkouts.cleanup, event.operation_id)
+            except OSError:
+                logger.exception(
+                    "github-watch checkout cleanup deferred to TTL event=%s",
+                    event.event_key,
+                )
+                continue
+            self._ledger.transition(
+                event.event_key,
+                expected=("dispatched",),
+                status="completed",
+                response=encoded,
+            )
 
     async def _ack_dispatched(self, event: EventState) -> None:
         """React with :eyes: on the item itself once a turn has been admitted."""

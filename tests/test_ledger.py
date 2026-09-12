@@ -88,11 +88,14 @@ def test_event_can_be_resolved_by_operation_and_turn_identity(tmp_path):
         event.event_key,
         expected=("turn_submitting",),
         status="dispatched",
-        turn_id="turn:one",
+        input_id="input:one",
+        response='{"status":"complete"}',
     )
 
     assert ledger.get_event_by_operation(event.operation_id).event_key == event.event_key
-    resolved = ledger.get_event_by_turn("turn:one")
+    resolved = ledger.get_event_by_input("programmatic:one", "input:one")
     assert resolved is not None
     assert resolved.operation_id == event.operation_id
+    assert resolved.input_id == "input:one"
+    assert resolved.response == '{"status":"complete"}'
     assert ledger.get_event_by_turn("turn:missing") is None

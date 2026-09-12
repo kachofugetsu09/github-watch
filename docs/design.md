@@ -48,8 +48,9 @@
 GitHub 保存远程权威事实；`events.sqlite3` 保存消费和恢复事实；Akashic
 `sessions.db` 只追加稳定 Session 与 Turn 消息。Session metadata 关闭 memory retrieval 和
 post-memory，避免 GitHub 任务进入长期记忆。每个仓库在 `plugin-data` 中复用裸镜像，每个
-operation 从精确提交创建唯一 detached worktree；typed TurnCommitted 按 Core Turn ID 找回并删除，
-进程中断时由轮询 TTL 清扫工作目录，并在下次 fetch 前 prune 已失效的 worktree 管理记录。
+operation 从精确提交创建唯一 detached worktree；`programmatic/message/result` 按已接纳 Input 的
+`message_id` 读取 Turn 终态并清理，进程中断时由轮询 TTL 清扫工作目录，并在下次 fetch 前 prune
+已失效的 worktree 管理记录。
 
 配置通知目标时，prompt 允许 Agent 在需要维护者决策、关键阻塞/风险或极重要结果时，向固定主
 channel 调用一次 `message_push`。通知不取代 GitHub comment/review，不等待主 channel 回复；普通
@@ -72,7 +73,8 @@ discovered → claimed → context_ready → turn_submitting → dispatched
 
 - `claimed/context_ready` 在重启后可安全回到 `discovered`，因为 turn 尚未提交。
 - `turn_submitting` 中断后转为 `manual_reconcile`，不自动重试。
-- programmatic Turn 返回 identity 后立即进入终态 `dispatched`；插件不等待 Turn 完成。
+- programmatic Message 返回 accepted Input identity 后立即进入 `dispatched`；后续轮询读取
+  `message/result`，只有完整结果才结束 checkout 生命周期。
 - Agent 自行发送 comment，发送前检查稳定 operation marker，已有则不重复发送。
 - 带 operation marker 的 comment 永不触发 owner mention，避免 owner 凭证发送时形成自激循环。
 
@@ -111,7 +113,7 @@ GET 和短命 installation token 交换遇到短暂 TLS、连接或不完整响�
 ┌──────────────────┐  programmatic.v1 ┌────────────────────┐
 │ domain dispatch  │ ───────────────────▶ │ Session/Turn owner │
 └────────┬─────────┘                   └────────────────────┘
-         │ tools.v1 descriptors + typed TurnCommitted listener
+         │ tools.v1 descriptors + programmatic result reader
          ▼
 ┌──────────────────┐                   ┌────────────────────────┐
 │ GitHub/checkout  │                   │ tools.v1/events        │
@@ -120,7 +122,8 @@ GET 和短命 installation token 交换遇到短暂 TLS、连接或不完整响�
 ```
 
 插件不取得 Core control plane、Session store 或 job host。`programmatic.v1` 只接受
-创建 invocation-scoped Session 与提交普通输入；Core 负责生成不可伪造的 Session/Turn receipt。
+创建 invocation-scoped Session 与提交普通输入；Core 返回不可伪造的 Session/Input receipt，
+插件用同一 Input 身份读取投影的完成结果。
 Tool 的 operation/thread 绑定仍由 SQLite event identity 与 Core 提供的不可变 Tool execution
 context 双重确定，不再重复读取可变 Session metadata。
 

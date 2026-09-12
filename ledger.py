@@ -36,6 +36,8 @@ class EventState:
     status: str
     thread_id: str | None
     turn_id: str | None
+    input_id: str | None = None
+    response: str | None = None
 
 
 class EventLedger:
@@ -238,7 +240,8 @@ class EventLedger:
             row = connection.execute(
                 """
                 SELECT event_key, operation_id, repo, kind, number,
-                       trigger_kind, trigger_id, status, thread_id, turn_id
+                       trigger_kind, trigger_id, status, thread_id, turn_id,
+                       input_id, response
                 FROM events WHERE event_key = ?
                 """,
                 (event_key,),
@@ -252,7 +255,8 @@ class EventLedger:
             row = connection.execute(
                 """
                 SELECT event_key, operation_id, repo, kind, number,
-                       trigger_kind, trigger_id, status, thread_id, turn_id
+                       trigger_kind, trigger_id, status, thread_id, turn_id,
+                       input_id, response
                 FROM events WHERE operation_id = ?
                 """,
                 (operation_id,),
@@ -266,10 +270,25 @@ class EventLedger:
             row = connection.execute(
                 """
                 SELECT event_key, operation_id, repo, kind, number,
-                       trigger_kind, trigger_id, status, thread_id, turn_id
+                       trigger_kind, trigger_id, status, thread_id, turn_id,
+                       input_id, response
                 FROM events WHERE turn_id = ?
                 """,
                 (turn_id,),
+            ).fetchone()
+        return EventState(*row) if row is not None else None
+
+    def get_event_by_input(self, session_id: str, input_id: str) -> EventState | None:
+        """Resolve one dispatched event by the accepted programmatic Input identity."""
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT event_key, operation_id, repo, kind, number,
+                       trigger_kind, trigger_id, status, thread_id, turn_id,
+                       input_id, response
+                FROM events WHERE thread_id = ? AND input_id = ?
+                """,
+                (session_id, input_id),
             ).fetchone()
         return EventState(*row) if row is not None else None
 
@@ -278,8 +297,24 @@ class EventLedger:
             rows = connection.execute(
                 """
                 SELECT event_key, operation_id, repo, kind, number,
-                       trigger_kind, trigger_id, status, thread_id, turn_id
+                       trigger_kind, trigger_id, status, thread_id, turn_id,
+                       input_id, response
                 FROM events WHERE status = 'discovered'
+                ORDER BY created_at, event_key
+                """
+            ).fetchall()
+        return [EventState(*row) for row in rows]
+
+    def dispatched_events(self) -> list[EventState]:
+        """Return admitted events whose programmatic result still needs observing."""
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT event_key, operation_id, repo, kind, number,
+                       trigger_kind, trigger_id, status, thread_id, turn_id,
+                       input_id, response
+                FROM events
+                WHERE status = 'dispatched' AND input_id IS NOT NULL
                 ORDER BY created_at, event_key
                 """
             ).fetchall()
@@ -293,6 +328,7 @@ class EventLedger:
         status: str,
         thread_id: str | None = None,
         turn_id: str | None = None,
+        input_id: str | None = None,
         response: str | None = None,
         artifact_id: str | None = None,
         error: str | None = None,
@@ -302,6 +338,7 @@ class EventLedger:
         for column, value in (
             ("thread_id", thread_id),
             ("turn_id", turn_id),
+            ("input_id", input_id),
             ("response", response),
             ("artifact_id", artifact_id),
             ("error", error),
@@ -359,6 +396,7 @@ class EventLedger:
                     status TEXT NOT NULL,
                     thread_id TEXT,
                     turn_id TEXT,
+                    input_id TEXT,
                     response TEXT,
                     artifact_id TEXT,
                     error TEXT,
@@ -379,6 +417,11 @@ class EventLedger:
             connection.execute(
                 "ALTER TABLE items ADD COLUMN draft INTEGER NOT NULL DEFAULT 0"
             )
+        event_columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(events)")
+        }
+        if "input_id" not in event_columns:
+            connection.execute("ALTER TABLE events ADD COLUMN input_id TEXT")
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.path, timeout=10)

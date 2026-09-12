@@ -31,7 +31,7 @@ class FakeTurns:
     async def submit(self, session_id: str, content: str) -> object:
         self.submitted.append((session_id, content))
         self.prompt = content
-        return SimpleNamespace(session_id=session_id, turn_id="turn-1")
+        return SimpleNamespace(session_id=session_id, input_id="input-1")
 
 
 def _event_in_context_ready(ledger: EventLedger):
@@ -100,7 +100,7 @@ def test_dispatch_returns_after_turn_admission_without_waiting_for_result(
     dispatched = ledger.get_event(event.event_key)
     assert dispatched.status == "dispatched"
     assert dispatched.thread_id == "thread-1"
-    assert dispatched.turn_id == "turn-1"
+    assert dispatched.input_id == "input-1"
     assert turns.created == []
     assert [item[0] for item in turns.submitted] == ["thread-1"]
     assert turns.prompt is not None
@@ -163,6 +163,119 @@ def test_dispatch_persists_new_session_before_turn_submission(tmp_path: Path) ->
     assert item is not None and item.thread_id == "thread-created"
 
 
+def test_reconcile_reads_projected_complete_result_before_cleanup(tmp_path: Path) -> None:
+    ledger = EventLedger(tmp_path / "events.sqlite3")
+    event = _event_in_context_ready(ledger)
+    ledger.transition(
+        event.event_key,
+        expected=("discovered",),
+        status="claimed",
+    )
+    ledger.transition(
+        event.event_key,
+        expected=("claimed",),
+        status="context_ready",
+    )
+    ledger.transition(
+        event.event_key,
+        expected=("context_ready",),
+        status="dispatched",
+        thread_id="thread-1",
+        input_id="input-1",
+    )
+    cleanup_calls: list[str] = []
+
+    class Checkouts:
+        def cleanup(self, operation_id: str) -> bool:
+            cleanup_calls.append(operation_id)
+            return True
+
+    class Turns:
+        calls: list[tuple[str, str]] = []
+
+        async def result(self, session_id: str, input_id: str) -> dict[str, object]:
+            self.calls.append((session_id, input_id))
+            return {
+                "version": 2,
+                "session_id": session_id,
+                "input_id": input_id,
+                "status": "complete",
+                "ending_message_id": "output-1",
+                "ending_seq": 2,
+                "through_seq": 2,
+            }
+
+    watch = GitHubWatch(
+        client=FakeGitHub(),  # type: ignore[arg-type]
+        ledger=ledger,
+        checkouts=Checkouts(),  # type: ignore[arg-type]
+        data_dir=tmp_path,
+        mention="@akashic-review-bot",
+        bot_login="akashic-review-bot[bot]",
+    )
+    turns = Turns()
+
+    asyncio.run(watch._reconcile_dispatched(turns))
+
+    finished = ledger.get_event(event.event_key)
+    assert finished.status == "completed"
+    assert finished.thread_id == "thread-1"
+    assert finished.input_id == "input-1"
+    assert '"ending_message_id": "output-1"' in (finished.response or "")
+    assert turns.calls == [("thread-1", "input-1")]
+    assert cleanup_calls == [event.operation_id]
+
+
+def test_reconcile_terminal_failure_preserves_manual_reconcile_boundary(tmp_path: Path) -> None:
+    ledger = EventLedger(tmp_path / "events.sqlite3")
+    event = _event_in_context_ready(ledger)
+    ledger.transition(event.event_key, expected=("discovered",), status="claimed")
+    ledger.transition(event.event_key, expected=("claimed",), status="context_ready")
+    ledger.transition(
+        event.event_key,
+        expected=("context_ready",),
+        status="dispatched",
+        thread_id="thread-1",
+        input_id="input-1",
+    )
+    cleanup_calls: list[str] = []
+
+    class Checkouts:
+        def cleanup(self, operation_id: str) -> bool:
+            cleanup_calls.append(operation_id)
+            return True
+
+    class Turns:
+        async def result(self, session_id: str, input_id: str) -> dict[str, object]:
+            return {
+                "version": 2,
+                "session_id": session_id,
+                "input_id": input_id,
+                "status": "failure",
+                "ending_message_id": "failure-1",
+                "ending_seq": 2,
+                "through_seq": 2,
+                "reason": "model unavailable",
+            }
+
+    watch = GitHubWatch(
+        client=FakeGitHub(),  # type: ignore[arg-type]
+        ledger=ledger,
+        checkouts=Checkouts(),  # type: ignore[arg-type]
+        data_dir=tmp_path,
+        mention="@akashic-review-bot",
+        bot_login="akashic-review-bot[bot]",
+    )
+
+    asyncio.run(watch._reconcile_dispatched(Turns()))
+
+    failed = ledger.get_event(event.event_key)
+    assert failed.status == "manual_reconcile"
+    assert failed.input_id == "input-1"
+    assert '"status": "failure"' in (failed.response or "")
+    assert cleanup_calls == []
+
+
 def test_dispatch_reuses_durable_session_across_invocations_without_duplicate_turn(
     tmp_path: Path,
 ) -> None:
@@ -216,7 +329,7 @@ def test_dispatch_reuses_durable_session_across_invocations_without_duplicate_tu
 
         async def submit(self, session_id: str, content: str) -> object:
             self.submitted.append((session_id, content))
-            return SimpleNamespace(session_id=session_id, turn_id="turn-2")
+            return SimpleNamespace(session_id=session_id, input_id="input-2")
 
         async def create_session(self, *, metadata: dict[str, object]) -> str:
             del metadata
@@ -235,8 +348,8 @@ def test_dispatch_reuses_durable_session_across_invocations_without_duplicate_tu
     assert len(first_turns.submitted) == 1
     assert len(second_turns.submitted) == 1
     assert second_turns.submitted[0][0] == "thread-created"
-    assert ledger.get_event(first_event.event_key).turn_id == "turn-1"
-    assert ledger.get_event(second_event.event_key).turn_id == "turn-2"
+    assert ledger.get_event(first_event.event_key).input_id == "input-1"
+    assert ledger.get_event(second_event.event_key).input_id == "input-2"
 
 
 def test_pr_prompt_forbids_recursive_replacement_pull_request(tmp_path: Path) -> None:
@@ -402,8 +515,8 @@ def test_prompt_failure_stays_before_uncertain_turn_boundary(
 @pytest.mark.parametrize(
     "receipt",
     (
-        SimpleNamespace(session_id="wrong-session", turn_id="turn-1"),
-        SimpleNamespace(session_id="thread-1", turn_id=""),
+        SimpleNamespace(session_id="wrong-session", input_id="input-1"),
+        SimpleNamespace(session_id="thread-1", input_id=""),
     ),
 )
 def test_invalid_core_receipt_is_uncertain_after_submission(

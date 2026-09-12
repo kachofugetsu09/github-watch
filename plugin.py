@@ -24,8 +24,6 @@ from agent.plugin_composition import (
 )
 from agent.plugin_contracts import ContentPart
 from agent.tool_catalog import validate_tool_parameters
-from agent.turn_events.after_turn import AFTER_TURN_COMMITTED
-from bus.events_lifecycle import TurnCommitted
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from .checkout import CheckoutManager
@@ -206,9 +204,15 @@ class _MessageSendParams:
 
 
 @dataclass(frozen=True, slots=True)
-class _AcceptedTurn:
+class _MessageResultParams:
     session_id: str
-    turn_id: str
+    input_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class _AcceptedInput:
+    session_id: str
+    input_id: str
 
 
 class _ProgrammaticTurnPort:
@@ -236,7 +240,7 @@ class _ProgrammaticTurnPort:
             )
         return session_id
 
-    async def submit(self, session_id: str, content: str) -> _AcceptedTurn:
+    async def submit(self, session_id: str, content: str) -> _AcceptedInput:
         message_id = "github-watch:" + sha256(
             f"{session_id}\n{content}".encode("utf-8")
         ).hexdigest()
@@ -249,16 +253,39 @@ class _ProgrammaticTurnPort:
             ),
         )
         returned_session = result.get("session_id")
-        turn_id = result.get("turn_id")
+        returned_message = result.get("message_id")
         if returned_session != session_id:
             raise ProgrammaticTurnUncertainError(
-                "programmatic Turn receipt returned mismatched Session identity"
+                "programmatic Message receipt returned mismatched Session identity"
             )
-        if not isinstance(turn_id, str) or not turn_id:
+        if returned_message != message_id:
             raise ProgrammaticTurnUncertainError(
-                "programmatic Turn receipt omitted the accepted turn_id"
+                "programmatic Message receipt did not confirm the submitted input identity"
             )
-        return _AcceptedTurn(session_id, turn_id)
+        return _AcceptedInput(session_id, message_id)
+
+    async def result(self, session_id: str, input_id: str) -> Mapping[str, object]:
+        """Read the projected result for the exact accepted Input identity."""
+        result = await self._service.call(
+            "programmatic/message/result",
+            _MessageResultParams(session_id=session_id, input_id=input_id),
+        )
+        if result.get("session_id") != session_id or result.get("input_id") != input_id:
+            raise ProgrammaticTurnUncertainError(
+                "programmatic result returned mismatched Message identity"
+            )
+        status = result.get("status")
+        if status not in {"open", "complete", "pause", "failure"}:
+            raise ProgrammaticTurnUncertainError(
+                f"programmatic result returned invalid status: {status!r}"
+            )
+        if status != "open":
+            ending = result.get("ending_message_id")
+            if not isinstance(ending, str) or not ending:
+                raise ProgrammaticTurnUncertainError(
+                    "programmatic terminal result omitted ending_message_id"
+                )
+        return result
 
 
 @dataclass(frozen=True, slots=True)
@@ -575,29 +602,6 @@ async def run_github_watch_create_pr(
     return json.dumps(result, ensure_ascii=False, sort_keys=True)
 
 
-def _cleanup_committed_turn(event: TurnCommitted) -> None:
-    bound = _bound
-    if bound is None:
-        return
-    owned = bound.ledger.get_event_by_turn(event.turn_id)
-    if owned is None or owned.thread_id != event.session_key:
-        return
-    try:
-        removed = bound.checkouts.cleanup(owned.operation_id)
-    except OSError:
-        logger.exception(
-            "github-watch checkout cleanup deferred to TTL event=%s",
-            owned.event_key,
-        )
-        return
-    if removed:
-        logger.info("github-watch checkout removed event=%s", owned.event_key)
-
-
-def _on_turn_committed(event: TurnCommitted) -> None:
-    _cleanup_committed_turn(event)
-
-
 def _tool_specs() -> tuple[_ToolSpec, ...]:
     return (
         _ToolSpec(
@@ -743,6 +747,3 @@ async def apply(ctx: Context, config: GitHubWatchConfig) -> None:
 
     _ = await ctx.on(RUNTIME_STARTED, start)
     _ = await ctx.on(RUNTIME_STOPPING, stop)
-
-    # 3. Cleanup observes only the matching session and committed Turn identity.
-    await ctx.on(AFTER_TURN_COMMITTED, _on_turn_committed)

@@ -8,6 +8,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
@@ -76,10 +77,6 @@ def _load_plugin_module():
     composition = ModuleType("agent.plugin_composition")
     contracts = ModuleType("agent.plugin_contracts")
     tool_catalog = ModuleType("agent.tool_catalog")
-    turn_events = ModuleType("agent.turn_events")
-    after_turn = ModuleType("agent.turn_events.after_turn")
-    bus = ModuleType("bus")
-    events_lifecycle = ModuleType("bus.events_lifecycle")
 
     class Context:
         pass
@@ -108,11 +105,6 @@ def _load_plugin_module():
         )
         return errors
 
-    class TurnCommitted:
-        def __init__(self, session_key: str, turn_id: str) -> None:
-            self.session_key = session_key
-            self.turn_id = turn_id
-
     composition.ServiceKey = ServiceKey  # type: ignore[attr-defined]
     composition.Context = Context  # type: ignore[attr-defined]
     composition.RUNTIME_STARTED = object()  # type: ignore[attr-defined]
@@ -121,18 +113,12 @@ def _load_plugin_module():
     composition.TimerStatus = SimpleNamespace(FIRED="fired")  # type: ignore[attr-defined]
     contracts.ContentPart = ContentPart  # type: ignore[attr-defined]
     tool_catalog.validate_tool_parameters = validate_tool_parameters  # type: ignore[attr-defined]
-    after_turn.AFTER_TURN_COMMITTED = object()  # type: ignore[attr-defined]
-    events_lifecycle.TurnCommitted = TurnCommitted  # type: ignore[attr-defined]
     sys.modules.update(
         {
             "agent": agent,
             "agent.plugin_composition": composition,
             "agent.plugin_contracts": contracts,
             "agent.tool_catalog": tool_catalog,
-            "agent.turn_events": turn_events,
-            "agent.turn_events.after_turn": after_turn,
-            "bus": bus,
-            "bus.events_lifecycle": events_lifecycle,
         }
     )
     _ = sys.modules.pop("github_watch_test_package.plugin", None)
@@ -232,7 +218,6 @@ def test_v3_apply_registers_candidate_inert_descriptors_without_pem_or_data(
         "external-side-effect",
     ]
     assert len(candidate.catalog.authorizations) == 4
-    assert any(key is plugin_module.AFTER_TURN_COMMITTED for key, _ in candidate.listeners)
     assert any(key is plugin_module.RUNTIME_STARTED for key, _ in candidate.listeners)
     assert any(key is plugin_module.RUNTIME_STOPPING for key, _ in candidate.listeners)
     assert sum(inspect.iscoroutinefunction(listener) for _, listener in candidate.listeners) == 2
@@ -295,7 +280,22 @@ def test_formal_job_lazily_builds_runtime_and_passes_invocation_turn_port(
         async def call(self, method: str, params: object) -> dict[str, object]:
             if method == "programmatic/session/admit":
                 return {"session_id": params.session_id}  # type: ignore[attr-defined]
-            return {"session_id": params.session_id, "turn_id": "turn-1"}  # type: ignore[attr-defined]
+            if method == "programmatic/message/send":
+                return {
+                    "session_id": params.session_id,  # type: ignore[attr-defined]
+                    "message_id": params.message_id,  # type: ignore[attr-defined]
+                    "seq": 1,
+                }
+            if method == "programmatic/message/result":
+                return {
+                    "version": 2,
+                    "session_id": params.session_id,  # type: ignore[attr-defined]
+                    "input_id": params.input_id,  # type: ignore[attr-defined]
+                    "status": "open",
+                    "ending_message_id": None,
+                    "through_seq": 1,
+                }
+            raise AssertionError(method)
 
     context._services[plugin_module.PROGRAMMATIC] = FakeProgrammatic()
     asyncio.run(plugin_module.run_github_watch_poll(context))
@@ -311,7 +311,7 @@ def test_formal_job_lazily_builds_runtime_and_passes_invocation_turn_port(
     assert session_id.startswith("programmatic:github-watch:")
     receipt = asyncio.run(turns.submit(session_id, "inspect"))
     assert receipt.session_id == session_id
-    assert receipt.turn_id == "turn-1"
+    assert receipt.input_id.startswith("github-watch:")
 
 
 def test_v3_handlers_have_exact_core_signatures() -> None:
@@ -385,6 +385,7 @@ def test_v3_entrypoint_has_no_legacy_runtime_categories() -> None:
         "get_current_tool_context",
         "TurnAdmissionPreconditionFailure",
         "TurnAdmissionUncertain",
+        "turn_id",
         "class Tool",
         "_CompositionAgentInput",
         "GitHubWatchRuntime",
@@ -548,8 +549,132 @@ def test_tools_v1_archive_opens_real_provider_and_preserves_five_descriptors() -
     }
 
 
-def test_programmatic_adapter_rejects_message_ack_without_accepted_turn() -> None:
-    """A message ACK cannot be persisted as a fake Turn identity."""
+def test_programmatic_archive_uses_real_message_ack_and_projected_result() -> None:
+    """Run the adapter against Core's real programmatic provider, without turn_id stubs."""
+
+    root = Path(__file__).parents[1]
+    core_root = next(
+        (
+            Path(path)
+            for path in sys.path
+            if (Path(path) / "agent/plugin_composition").is_dir()
+            and (Path(path) / "plugins/programmatic/plugin.py").is_file()
+        ),
+        None,
+    )
+    if core_root is None:
+        pytest.fail("该验收必须在带 Core PYTHONPATH 的环境运行")
+    script = dedent(
+        r'''
+        import asyncio
+        import importlib.util
+        import os
+        import shutil
+        import sys
+        from pathlib import Path
+        from types import ModuleType
+
+        from agent.config_models import Config
+        from agent.plugins.snapshot import lease_runtime_snapshot
+        from bootstrap import tools as bootstrap
+        from core.net.http import SharedHttpResources
+        from plugins.content.plugin import check_text
+        from plugins.programmatic.control import AdmitParams, PROGRAMMATIC
+        from plugins.programmatic.control import SendParams
+        from agent.plugin_contracts import ContentPart, Output
+
+        core_root = Path(sys.argv[1])
+        plugin_root = Path(sys.argv[2])
+        scratch = Path(sys.argv[3])
+        source = scratch / "plugins"
+        workspace = scratch / "workspace"
+        workspace.mkdir(parents=True)
+        os.environ["AKASHIC_PLUGIN_HOME"] = str(scratch / "plugin-home")
+        for name in ("conversation", "sources", "content", "models", "programmatic", "turn_projection"):
+            shutil.copytree(core_root / "plugins" / name, source / name)
+        bootstrap._resolve_plugin_dirs = lambda _config: [source]
+
+        package = ModuleType("github_watch_real")
+        package.__path__ = [str(plugin_root)]
+        sys.modules[package.__name__] = package
+        spec = importlib.util.spec_from_file_location(
+            "github_watch_real.plugin", plugin_root / "plugin.py",
+            submodule_search_locations=[],
+        )
+        if spec is None or spec.loader is None:
+            raise RuntimeError("无法加载 GitHub Watch entrypoint")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+
+        async def main():
+            http = SharedHttpResources()
+            core = bootstrap.build_core_runtime(Config(), workspace, http)
+            try:
+                await core.start()
+                session = "programmatic:github-watch-real"
+                async with lease_runtime_snapshot(core.plugin_manager.snapshot_store) as snapshot:
+                    api = snapshot.composition_root.context.require(PROGRAMMATIC)
+                    await api.call("programmatic/session/admit", AdmitParams(session_id=session))
+                    port = module._ProgrammaticTurnPort(api)
+                    accepted_session = await port.create_session(
+                        metadata={"repo": "owner/repo", "item": "issue#1"}
+                    )
+                    accepted = await port.submit(accepted_session, "inspect")
+                    if not accepted.input_id.startswith("github-watch:"):
+                        raise AssertionError(f"unexpected accepted input: {accepted!r}")
+                    rows = core.message_log.reader(accepted.session_id).snapshot()
+                    if not any(row.message_id == accepted.input_id for row in rows):
+                        raise AssertionError("accepted Input was not durably written")
+                    writer = core.message_log.writer(
+                        accepted.session_id, author="fixture", source="programmatic",
+                        body_types=(Output,), content={"text": check_text},
+                    )
+                    writer.append(
+                        "github-watch-final",
+                        Output((ContentPart("text", "real output"),), "complete"),
+                    )
+                    result = await port.result(accepted.session_id, accepted.input_id)
+                    if result["status"] != "complete":
+                        raise AssertionError(f"unexpected projected status: {result!r}")
+                    if result["ending_message_id"] != "github-watch-final":
+                        raise AssertionError(f"unexpected final output: {result!r}")
+                    receipt = await api.call(
+                        "programmatic/message/send",
+                        SendParams(
+                            session_id=accepted.session_id,
+                            message_id=accepted.input_id,
+                            text="inspect",
+                        ),
+                    )
+                    if "turn_id" in receipt:
+                        raise AssertionError("programmatic send returned a fake/private turn_id")
+                print("real-programmatic-result-ok")
+            finally:
+                await core.bus.aclose()
+                await core.stop()
+                await http.aclose()
+
+        asyncio.run(main())
+        ''',
+    )
+    scratch = Path(tempfile.mkdtemp(prefix="akasic-github-watch-real-programmatic-", dir="/mnt/data"))
+    env = dict(os.environ)
+    env["PYTHONPATH"] = os.pathsep.join((str(core_root), str(root)))
+    completed = subprocess.run(
+        [sys.executable, "-c", script, str(core_root), str(root), str(scratch)],
+        cwd=root,
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 0, completed.stderr or completed.stdout
+    assert completed.stdout.strip() == "real-programmatic-result-ok"
+
+
+def test_programmatic_adapter_rejects_message_ack_without_matching_input() -> None:
+    """A mismatched Message ACK cannot be persisted as the accepted Input identity."""
 
     plugin_module = _load_plugin_module()
 
@@ -559,7 +684,7 @@ def test_programmatic_adapter_rejects_message_ack_without_accepted_turn() -> Non
                 return {"session_id": params.session_id}  # type: ignore[attr-defined]
             return {
                 "session_id": params.session_id,  # type: ignore[attr-defined]
-                "message_id": "input-1",
+                "message_id": "different-input",
             }
 
     async def submit() -> None:
@@ -569,8 +694,53 @@ def test_programmatic_adapter_rejects_message_ack_without_accepted_turn() -> Non
         )
         with pytest.raises(
             plugin_module.ProgrammaticTurnUncertainError,
-            match="accepted turn_id",
+            match="submitted input identity",
         ):
             await port.submit(session_id, "body")
 
     asyncio.run(submit())
+
+
+def test_programmatic_adapter_reads_result_by_accepted_input_identity() -> None:
+    plugin_module = _load_plugin_module()
+    calls: list[tuple[str, object]] = []
+
+    class MessageResultProvider:
+        async def call(self, method: str, params: object) -> dict[str, object]:
+            calls.append((method, params))
+            if method == "programmatic/session/admit":
+                return {"session_id": params.session_id}  # type: ignore[attr-defined]
+            if method == "programmatic/message/send":
+                return {
+                    "session_id": params.session_id,  # type: ignore[attr-defined]
+                    "message_id": params.message_id,  # type: ignore[attr-defined]
+                    "seq": 1,
+                }
+            if method == "programmatic/message/result":
+                return {
+                    "version": 2,
+                    "session_id": params.session_id,  # type: ignore[attr-defined]
+                    "input_id": params.input_id,  # type: ignore[attr-defined]
+                    "status": "complete",
+                    "ending_message_id": "output-1",
+                    "ending_seq": 2,
+                    "through_seq": 2,
+                }
+            raise AssertionError(method)
+
+    async def exercise() -> None:
+        port = plugin_module._ProgrammaticTurnPort(MessageResultProvider())
+        session_id = await port.create_session(
+            metadata={"repo": "owner/repo", "item": "issue#1"}
+        )
+        accepted = await port.submit(session_id, "body")
+        result = await port.result(session_id, accepted.input_id)
+        assert result["status"] == "complete"
+        assert result["ending_message_id"] == "output-1"
+
+    asyncio.run(exercise())
+    assert [method for method, _ in calls] == [
+        "programmatic/session/admit",
+        "programmatic/message/send",
+        "programmatic/message/result",
+    ]
