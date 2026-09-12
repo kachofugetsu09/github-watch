@@ -6,11 +6,11 @@ from types import SimpleNamespace
 
 import pytest
 
-from agent.plugin_composition import (
+from github_watch_test_package.github_watch import (
+    GitHubWatch,
     ProgrammaticTurnPreAdmissionError,
     ProgrammaticTurnUncertainError,
 )
-from github_watch_test_package.github_watch import GitHubWatch
 from github_watch_test_package.ledger import EventLedger
 
 

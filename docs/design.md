@@ -102,24 +102,24 @@ GET 和短命 installation token 交换遇到短暂 TLS、连接或不完整响�
 ## v3 组合所有权
 
 ```text
-┌──────────────────┐  core.background_jobs ┌────────────────────┐
+┌──────────────────┐  core.timers/lifecycle ┌────────────────────┐
 │ GitHub Watch     │ ◀──────────────── │ stable snapshot    │
-│ polling + ledger │                   │ cadence + coalesce │
+│ polling + ledger │                   │ timer + generation │
 └────────┬─────────┘                   └────────────────────┘
-         │ BackgroundJobContext.turns
+         │ programmatic.v1
          ▼
-┌──────────────────┐  core.background_jobs ┌────────────────────┐
+┌──────────────────┐  programmatic.v1 ┌────────────────────┐
 │ domain dispatch  │ ───────────────────▶ │ Session/Turn owner │
 └────────┬─────────┘                   └────────────────────┘
-         │ TOOL_CATALOG descriptors + typed TurnCommitted listener
+         │ tools.v1 descriptors + typed TurnCommitted listener
          ▼
 ┌──────────────────┐                   ┌────────────────────────┐
-│ GitHub/checkout  │                   │ core.tool_catalog/events│
-│ SQLite/evidence  │                   │ registry + timing      │
+│ GitHub/checkout  │                   │ tools.v1/events        │
+│ SQLite/evidence  │                   │ registry + lifecycle   │
 └──────────────────┘                   └────────────────────────┘
 ```
 
-插件不取得 Core control plane、Session store 或 job host。`BackgroundJobContext.turns` 只接受
+插件不取得 Core control plane、Session store 或 job host。`programmatic.v1` 只接受
 创建 invocation-scoped Session 与提交普通输入；Core 负责生成不可伪造的 Session/Turn receipt。
 Tool 的 operation/thread 绑定仍由 SQLite event identity 与 Core 提供的不可变 Tool execution
 context 双重确定，不再重复读取可变 Session metadata。

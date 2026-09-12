@@ -10,10 +10,14 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Protocol
 
-from agent.plugin_composition import (
-    ProgrammaticTurnPreAdmissionError,
-    ProgrammaticTurnUncertainError,
-)
+
+
+class ProgrammaticTurnPreAdmissionError(RuntimeError):
+    """The programmatic provider rejected a turn before durable submission."""
+
+
+class ProgrammaticTurnUncertainError(RuntimeError):
+    """The programmatic provider did not return a durable turn receipt."""
 
 from .context_bundle import ContextBundle
 from .checkout import CheckoutManager
