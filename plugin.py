@@ -14,17 +14,16 @@ from typing import Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
-from agent.control.timer import TimerStatus
-from agent.plugin_composition import Context, RUNTIME_STARTED, RUNTIME_STOPPING, ServiceKey
-from agent.plugin_composition.messages import MESSAGE_CATALOG
+from agent.plugin_composition import Context, RUNTIME_STARTED, RUNTIME_STOPPING, ServiceKey, TimerStatus
+from agent.plugin_composition.messages import MESSAGE_CATALOG, MessageCatalog
 from agent.plugin_composition.timers import TIMERS
-from plugins.programmatic.control import AdmitParams, PROGRAMMATIC, Programmatic, SendParams
-from plugins.tools.api import BoundTool, CallSource, InvalidArguments, Result
-from plugins.tools.plugin import TOOLS, ToolView
-from plugins.turn_projection.plugin import TURN_PROJECTION, TurnProjection
-from session.log import MessageCatalog
-from session.message import ContentPart, Input
-from session.message_codec import json_value
+from agent.plugin_contracts import ContentPart, Input, json_value
+
+from .contracts import (
+    AdmitParams, BoundTool, CallSource, InvalidArguments, PROGRAMMATIC,
+    ProgrammaticService, Result, SendParams, ToolView, TOOLS, TURN_PROJECTION,
+    TurnProjection,
+)
 
 from .checkout import CheckoutManager
 from .github_client import GitHubClient
@@ -104,7 +103,7 @@ _MODELS: dict[str, type[BaseModel]] = {
 
 class _ProgrammaticMessages(ProgrammaticMessagePort):
     """Adapt the ordinary programmatic source without inventing a Turn identity."""
-    def __init__(self, api: Programmatic) -> None:
+    def __init__(self, api: ProgrammaticService) -> None:
         self._api = api
 
     async def admit(self, session_id: str) -> None:
