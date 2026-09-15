@@ -27,7 +27,14 @@ Akashic API v3 插件。它轮询 GitHub，把可处理事件作为 programmatic
 
 ## 配置
 
-复制 `config.example.toml` 到安装后的私有配置目录，填写 GitHub App 的 app id、installation id、PEM 绝对路径、仓库列表和可选通知目标。私钥及 installation token 不写入账本或证据包。
+编辑一份 `config.example.toml` 副本，填写 GitHub App 的 app id、installation id、PEM 绝对路径、仓库列表和可选通知目标。用安装环境显式保存为固定输入；`apply(ctx)` 自行解析 `ctx.config`，不再使用插件 manifest。私钥及 installation token 不写入配置、账本或证据包。
+
+```bash
+python scripts/configure.py --data-dir <workspace>/plugin-data/github-watch-github \
+  --from-file /path/to/github-watch.toml
+```
+
+已有 `config.local.toml` 时，停机后执行 `scripts/configure.py --data-dir <workspace>/plugin-data/github-watch-github --upgrade`。原配置与命名备份移到私有恢复目录，所有字段值及 PEM 路径保持不变；不复制或改写 PEM。
 
 从 3.x 升级到 4.0.0 时，先停止 runtime，再显式删除已经失效的 Turn 超时配置：
 
