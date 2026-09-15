@@ -1,13 +1,11 @@
 from __future__ import annotations
 
 import asyncio
-import ast
 import json
 import os
 import shutil
 import subprocess
 import threading
-import tomllib
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -16,6 +14,7 @@ from typing import cast
 import pytest
 
 from agent.plugin_composition.bindings import Bindings
+from agent.plugin_composition.config_input import save_config
 from agent.plugins.snapshot import lease_runtime_snapshot
 from plugins.content.plugin import check_text
 from plugins.programmatic.control import AdmitParams, PROGRAMMATIC, SendParams
@@ -25,39 +24,6 @@ from session.message import CallRef, ContentPart, Output, ToolCall, ToolResult
 from tests.test_default_reply import application
 
 from github_watch_test_package.ledger import EventLedger
-
-
-def _static_identity(root: Path) -> tuple[dict[str, object], dict[str, object]]:
-    manifest = tomllib.loads((root / "akashic.plugin.toml").read_text(encoding="utf-8"))
-    tree = ast.parse((root / "plugin.py").read_text(encoding="utf-8"))
-    values: dict[str, object] = {}
-    for node in tree.body:
-        if not isinstance(node, (ast.Assign, ast.AnnAssign)):
-            continue
-        targets = node.targets if isinstance(node, ast.Assign) else (node.target,)
-        for target in targets:
-            if isinstance(target, ast.Name) and target.id in {"name", "version", "api_version"}:
-                if isinstance(node.value, ast.Constant):
-                    values[target.id] = node.value.value
-    return manifest, values
-
-
-def test_static_manifest_matches_message_runtime_entrypoint() -> None:
-    root = Path(__file__).parents[1]
-    manifest, identity = _static_identity(root)
-    assert identity == {
-        "name": "github-watch", "version": "4.0.0", "api_version": 3,
-    }
-    assert manifest["name"] == identity["name"]
-    assert manifest["version"] == identity["version"]
-    source = (root / "plugin.py").read_text(encoding="utf-8")
-    coordinator = (root / "github_watch.py").read_text(encoding="utf-8")
-    for removed in (
-        "BACKGROUND_JOBS", "TOOL_CATALOG", "AFTER_TURN_COMMITTED",
-        "TurnCommitted", "ProgrammaticTurnPort", "turn/start",
-    ):
-        assert removed not in source
-        assert removed not in coordinator
 
 
 class _ApiHandler(BaseHTTPRequestHandler):
@@ -134,13 +100,10 @@ def _install_sources(sources: Path, plugin_root: Path, api: str, tmp_path: Path)
         ["openssl", "genpkey", "-algorithm", "RSA", "-pkeyopt", "rsa_keygen_bits:2048", "-out", str(pem)],
         check=True, capture_output=True,
     )
-    config = tmp_path / "workspace/plugin-data/github-watch-builtin/config.local.toml"
-    config.parent.mkdir(parents=True, exist_ok=True)
-    config.write_text(
-        f'app_id = 1\ninstallation_id = 2\npem_path = {str(pem)!r}\n'
-        'repositories = ["owner/repo"]\npoll_seconds = 15\n',
-        encoding="utf-8",
-    )
+    save_config(tmp_path / "workspace/plugin-data/github-watch-builtin", {
+        "app_id": 1, "installation_id": 2, "pem_path": str(pem),
+        "repositories": ["owner/repo"], "poll_seconds": 15,
+    })
 
 
 @pytest.mark.asyncio

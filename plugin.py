@@ -323,15 +323,15 @@ api_version = 3
 name = "github-watch"
 version = "4.0.0"
 desc = "轮询 GitHub，以 programmatic Message 启动工作并提供受约束的 GitHub 工具。"
-Config = GitHubWatchConfig
 inject = (TIMERS, PROGRAMMATIC, MESSAGE_CATALOG, TURN_PROJECTION, TOOLS)
 
 
 GITHUB_WATCH_TOOLS = ServiceKey[ToolView]("github-watch.tools.v1")
 
 
-async def apply(ctx: Context, config: GitHubWatchConfig) -> None:
+async def apply(ctx: Context) -> None:
     """注册普通 Tool 与生命周期；候选 Root 不打开 PEM、数据库或网络。"""
+    config = GitHubWatchConfig.model_validate(ctx.config)
     runtime = Runtime(ctx, config)
     catalog = ctx.require(TOOLS)
     await catalog.declare_group(ctx, always_on=True, description=desc)

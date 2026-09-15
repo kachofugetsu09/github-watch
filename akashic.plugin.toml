@@ -1,8 +1,0 @@
-schema_version = 1
-name = "github-watch"
-version = "4.0.0"
-api_version = 3
-entrypoint = "plugin.py"
-
-[validation]
-exclude_data_paths = ["checkouts", "mirror"]
