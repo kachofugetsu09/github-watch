@@ -7,7 +7,6 @@ import os
 import shutil
 import subprocess
 import threading
-import tomllib
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -15,8 +14,14 @@ from typing import cast
 
 import pytest
 
+from agent.plugin_composition.archive import encode_config
 from agent.plugin_composition.bindings import Bindings
+from agent.plugins.manager import PluginManager
 from agent.plugins.snapshot import lease_runtime_snapshot
+from agent.plugins.static_manifest import load_static_plugin_manifest
+from bus.event_bus import EventBus
+from infra.channels.artifacts import ChannelAttachmentArtifactStore
+from session.artifact_store import ArtifactStore
 from plugins.content.plugin import check_text
 from plugins.programmatic.control import AdmitParams, PROGRAMMATIC, SendParams
 from plugins.tools.api import MessageReply, result_message_id
@@ -27,8 +32,8 @@ from tests.test_default_reply import application
 from github_watch_test_package.ledger import EventLedger
 
 
-def _static_identity(root: Path) -> tuple[dict[str, object], dict[str, object]]:
-    manifest = tomllib.loads((root / "akashic.plugin.toml").read_text(encoding="utf-8"))
+def _static_identity(root: Path) -> tuple[object, dict[str, object]]:
+    manifest = load_static_plugin_manifest(root)
     tree = ast.parse((root / "plugin.py").read_text(encoding="utf-8"))
     values: dict[str, object] = {}
     for node in tree.body:
@@ -48,8 +53,8 @@ def test_static_manifest_matches_message_runtime_entrypoint() -> None:
     assert identity == {
         "name": "github-watch", "version": "4.0.0", "api_version": 3,
     }
-    assert manifest["name"] == identity["name"]
-    assert manifest["version"] == identity["version"]
+    assert manifest.name == identity["name"]
+    assert manifest.version == identity["version"]
     source = (root / "plugin.py").read_text(encoding="utf-8")
     coordinator = (root / "github_watch.py").read_text(encoding="utf-8")
     for removed in (
@@ -134,11 +139,23 @@ def _install_sources(sources: Path, plugin_root: Path, api: str, tmp_path: Path)
         ["openssl", "genpkey", "-algorithm", "RSA", "-pkeyopt", "rsa_keygen_bits:2048", "-out", str(pem)],
         check=True, capture_output=True,
     )
-    config = tmp_path / "workspace/plugin-data/github-watch-builtin/config.local.toml"
+    config = tmp_path / "workspace/plugin-data/github-watch-builtin/config.input.json"
     config.parent.mkdir(parents=True, exist_ok=True)
     config.write_text(
-        f'app_id = 1\ninstallation_id = 2\npem_path = {str(pem)!r}\n'
-        'repositories = ["owner/repo"]\npoll_seconds = 15\n',
+        json.dumps(
+            {
+                "version": 1,
+                "config": encode_config(
+                    {
+                        "app_id": 1,
+                        "installation_id": 2,
+                        "pem_path": str(pem),
+                        "repositories": ["owner/repo"],
+                        "poll_seconds": 15,
+                    }
+                ),
+            }
+        ),
         encoding="utf-8",
     )
 
@@ -191,8 +208,8 @@ async def test_real_manager_message_tool_db_and_restart_use_local_github_endpoin
             ledger.set_thread("owner/repo", "issue", 1, session_id)
 
             await host.start_runtime()
-            bindings = Bindings(log, host._archive, host.open_binding)
             async with lease_runtime_snapshot(host.snapshot_store) as snapshot:
+                bindings = Bindings(log, host._archive, snapshot.composition_root)
                 catalog = snapshot.composition_root.context.require(TOOLS)
                 binding = catalog.bind(snapshot.composition_root.context.require(ALL_TOOLS)().select("github_watch_post_comment"), bindings)
                 call_writer = log.writer(
@@ -237,8 +254,25 @@ async def test_real_manager_message_tool_db_and_restart_use_local_github_endpoin
                     await asyncio.sleep(0)
 
             await host.terminate_all()
-            await host.load_all()
-            await host.start_runtime()
-            await asyncio.sleep(0)
-            assert ledger.get_event(event.event_key).status == "completed"
-            assert len([row for row in writes if row[1].endswith("/issues/1/comments")]) == 1
+            store2 = ArtifactStore(tmp_path / "sessions.db")
+            artifacts2 = ChannelAttachmentArtifactStore(
+                workspace=tmp_path / "workspace",
+                metadata_store=store2,
+            )
+            host = PluginManager(
+                [tmp_path / "plugins"],
+                event_bus=EventBus(),
+                workspace=tmp_path / "workspace",
+                installed_cache_root=tmp_path / "home/cache",
+                message_log=log,
+                channel_attachment_store=artifacts2,
+            )
+            try:
+                await host.load_all()
+                await host.start_runtime()
+                await asyncio.sleep(0)
+                assert ledger.get_event(event.event_key).status == "completed"
+                assert len([row for row in writes if row[1].endswith("/issues/1/comments")]) == 1
+            finally:
+                await host.terminate_all()
+                store2.close()

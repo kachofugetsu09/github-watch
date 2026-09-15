@@ -330,9 +330,9 @@ inject = (TIMERS, PROGRAMMATIC, MESSAGE_CATALOG, TURN_PROJECTION, TOOLS)
 GITHUB_WATCH_TOOLS = ServiceKey[ToolView]("github-watch.tools.v1")
 
 
-async def apply(ctx: Context, config: GitHubWatchConfig) -> None:
+async def apply(ctx: Context) -> None:
     """注册普通 Tool 与生命周期；候选 Root 不打开 PEM、数据库或网络。"""
-    runtime = Runtime(ctx, config)
+    runtime = Runtime(ctx, GitHubWatchConfig.model_validate(ctx.config))
     catalog = ctx.require(TOOLS)
     await catalog.declare_group(ctx, always_on=True, description=desc)
     refs = []
