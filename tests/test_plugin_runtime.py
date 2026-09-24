@@ -15,9 +15,8 @@ from typing import cast
 import pytest
 
 from agent.plugin_composition.archive import encode_config
-from agent.plugin_composition.bindings import Bindings
+from agent.plugin_composition.bindings import BINDINGS
 from agent.plugins.manager import PluginManager
-from agent.plugins.snapshot import lease_runtime_snapshot
 from agent.plugins.static_manifest import load_static_plugin_manifest
 from bus.event_bus import EventBus
 from infra.channels.artifacts import ChannelAttachmentArtifactStore
@@ -183,9 +182,12 @@ async def test_real_manager_message_tool_db_and_restart_use_local_github_endpoin
             )
             assert event is not None
             input_id = "github-watch:" + event.operation_id
-            async with lease_runtime_snapshot(host.snapshot_store) as snapshot:
-                root = snapshot.composition_root
-                programmatic = root.context.require(PROGRAMMATIC)
+            root = host.live_root
+            assert root is not None
+            programmatic = root.context.require(PROGRAMMATIC)
+            source_generation = host.generation("programmatic")
+            assert source_generation is not None and source_generation.fiber is not None
+            async with source_generation.fiber.context.runtime_scope():
                 _ = await programmatic.call(
                     "programmatic/session/admit", AdmitParams(session_id=session_id),
                 )
@@ -208,33 +210,38 @@ async def test_real_manager_message_tool_db_and_restart_use_local_github_endpoin
             ledger.set_thread("owner/repo", "issue", 1, session_id)
 
             await host.start_runtime()
-            async with lease_runtime_snapshot(host.snapshot_store) as snapshot:
-                bindings = Bindings(log, host._archive, snapshot.composition_root)
-                catalog = snapshot.composition_root.context.require(TOOLS)
-                binding = catalog.bind(snapshot.composition_root.context.require(ALL_TOOLS)().select("github_watch_post_comment"), bindings)
-                call_writer = log.writer(
-                    session_id, author="assistant", source="programmatic",
-                    body_types=(Output,), content={}, check_call=lambda _call: None,
-                )
-                call_writer.append(
-                    "github-call",
-                    Output((ToolCall(binding, {
-                        "operation_id": event.operation_id, "body": "local review result",
-                    }),), "continue"),
-                )
-                ref = CallRef("github-call", 0)
-                result_writer = log.writer(
-                    session_id, author="tool", source="programmatic",
-                    body_types=(ToolResult,), content={"text": check_text}, call_ref=ref,
-                )
-                reply = MessageReply(
-                    result_message_id(ref), ref, log.reader(session_id), result_writer,
-                    lambda: None,
-                )
+            root = host.live_root
+            assert root is not None
+            bindings = root.context.require(BINDINGS)
+            catalog = root.context.require(TOOLS)
+            tool_generation = host.generation("tools")
+            assert tool_generation is not None and tool_generation.fiber is not None
+            async with tool_generation.fiber.context.runtime_scope():
+                binding = catalog.bind(root.context.require(ALL_TOOLS)().select("github_watch_post_comment"), bindings)
+            call_writer = log.writer(
+                session_id, author="assistant", source="programmatic",
+                body_types=(Output,), content={}, check_call=lambda _call: None,
+            )
+            call_writer.append(
+                "github-call",
+                Output((ToolCall(binding, {
+                    "operation_id": event.operation_id, "body": "local review result",
+                }),), "continue"),
+            )
+            ref = CallRef("github-call", 0)
+            result_writer = log.writer(
+                session_id, author="tool", source="programmatic",
+                body_types=(ToolResult,), content={"text": check_text}, call_ref=ref,
+            )
+            reply = MessageReply(
+                result_message_id(ref), ref, log.reader(session_id), result_writer,
+                lambda: None,
+            )
 
-                async def allow(_binding: str, _arguments: object):
-                    return {"allowed": True}
+            async def allow(_binding: str, _arguments: object):
+                return {"allowed": True}
 
+            async with tool_generation.fiber.context.runtime_scope():
                 execution = catalog.execution(allow)
                 result = await execution.execute_call(reply)
                 repeated = await execution.execute_call(reply)
