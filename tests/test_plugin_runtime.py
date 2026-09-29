@@ -16,6 +16,10 @@ from typing import cast
 import pytest
 
 from agent.plugin_composition.config_input import save_config
+from agent.plugins.manager import PluginManager
+from bus.event_bus import EventBus
+from infra.channels.artifacts import ChannelAttachmentArtifactStore
+from session.artifact_store import ArtifactStore
 from agent.plugin_composition.models import ToolCall as ModelToolCall
 from agent.plugin_contracts.tools import TOOL_PROGRAM
 from plugins.content.plugin import check_text
@@ -152,7 +156,11 @@ async def test_real_manager_message_tool_db_uses_local_github_endpoint(
 ) -> None:
     plugin_root = Path(__file__).parents[1]
     with _local_api() as (api, writes):
+        source_root: Path | None = None
+
         def add_sources(sources: Path) -> None:
+            nonlocal source_root
+            source_root = sources
             _install_sources(sources, plugin_root, api, tmp_path)
 
         async with application(
@@ -251,3 +259,35 @@ async def test_real_manager_message_tool_db_uses_local_github_endpoint(
 
             assert ledger.get_event(event.event_key).status == "completed"
             assert len([row for row in writes if row[1].endswith("/issues/1/comments")]) == 1
+
+            # A stopped Manager cannot reopen its own Root. Reuse the persisted
+            # selection and Message log through a fresh Manager instead.
+            await host.terminate_all()
+            assert source_root is not None
+            restart_bus = EventBus()
+            restart_metadata = ArtifactStore(tmp_path / "sessions.db")
+            restart_artifacts = ChannelAttachmentArtifactStore(
+                workspace=tmp_path / "workspace", metadata_store=restart_metadata,
+            )
+            restarted = PluginManager(
+                [source_root],
+                event_bus=restart_bus,
+                workspace=tmp_path / "workspace",
+                installed_cache_root=tmp_path / "home/cache",
+                message_log=log,
+                channel_attachment_store=restart_artifacts,
+            )
+            try:
+                await restarted.load_all()
+                await restarted.start_runtime()
+                await asyncio.sleep(0)
+                assert ledger.get_event(event.event_key).status == "completed"
+                comments = [
+                    row for row in writes
+                    if row[1].endswith("/issues/1/comments")
+                ]
+                assert len(comments) == 1
+            finally:
+                await restarted.terminate_all()
+                restart_metadata.close()
+                await restart_bus.aclose()
