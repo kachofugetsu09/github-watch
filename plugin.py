@@ -344,7 +344,6 @@ async def apply(ctx: Context, config: GitHubWatchConfig) -> None:
         refs.append(await catalog.register(
             ctx, name=tool_name, description=description, parameters=parameters,
             open=open_tool, idempotent=True,
-            risk="read-only" if action == "runtime_info" else "external-side-effect",
         ))
 
     await ctx.provide(GITHUB_WATCH_TOOLS, catalog.view(*refs))
