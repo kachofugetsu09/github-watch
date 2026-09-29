@@ -22,7 +22,7 @@ from agent.plugin_contracts import ContentPart, Input, json_value
 from .contracts import (
     AdmitParams, BoundTool, CallSource, InvalidArguments, PROGRAMMATIC,
     ProgrammaticService, Result, SendParams, ToolView, TOOLS, TURN_PROJECTION,
-    TurnProjection,
+    Turn, TurnProjection,
 )
 
 from .checkout import CheckoutManager
@@ -130,6 +130,8 @@ class Runtime:
         self._ctx = ctx
         self._config = config
         self._bound: tuple[EventLedger, CheckoutManager, GitHubOperations, GitHubWatch] | None = None
+        self._cleanup_lock = asyncio.Lock()
+        self._cleanup_heads: dict[str, int] = {}
 
     def bind(self) -> tuple[EventLedger, CheckoutManager, GitHubOperations, GitHubWatch]:
         """Open plugin state and external clients only inside the formal runtime."""
@@ -181,6 +183,11 @@ class Runtime:
                 raise
             except Exception:
                 logger.exception("github-watch poll failed; next interval will retry")
+            # The Input can wake the follower before poll marks its event dispatched.
+            async with self._ctx.runtime_scope():
+                await self.cleanup_completed(
+                    self._ctx.require(MESSAGE_CATALOG), self._ctx.require(TURN_PROJECTION),
+                )
             await self._wait(datetime.now(UTC) + timedelta(seconds=self._config.poll_seconds))
 
     async def _wait(self, deadline: datetime) -> None:
@@ -197,29 +204,68 @@ class Runtime:
 
     async def _cleanup_loop(self) -> None:
         catalog = self._ctx.require(MESSAGE_CATALOG)
-        async for _heads in catalog.follow():
+        async for heads in catalog.follow():
             async with self._ctx.runtime_scope():
-                self.cleanup_completed(catalog, self._ctx.require(TURN_PROJECTION))
+                await self.cleanup_completed(catalog, self._ctx.require(TURN_PROJECTION), heads)
 
-    def cleanup_completed(self, catalog: MessageCatalog, projection: TurnProjection) -> None:
-        """Delete only checkout files whose admitted Input has reached a Message terminal."""
+    async def cleanup_completed(
+        self, catalog: MessageCatalog, projection: TurnProjection,
+        heads: Mapping[str, int] | None = None,
+    ) -> None:
+        """Check changed prefixes off-loop and finish started work before scope teardown."""
+        self.bind()
+        # 1. Poll and Message wakes share one worker and one bounded progress map.
+        async with self._cleanup_lock:
+            job = asyncio.create_task(asyncio.to_thread(self._cleanup_completed, catalog, projection, heads))
+            cancelled = False
+            while not job.done():
+                try:
+                    await asyncio.shield(job)
+                except asyncio.CancelledError:
+                    cancelled = True
+            job.result()
+            if cancelled:
+                raise asyncio.CancelledError
+
+    def _cleanup_completed(
+        self, catalog: MessageCatalog, projection: TurnProjection,
+        heads: Mapping[str, int] | None,
+    ) -> None:
+        """Delete completed checkouts before settling their durable event records."""
         ledger, checkouts, _, _ = self.bind()
-        for event in ledger.dispatched_events():
+        events = ledger.dispatched_events()
+        if heads is None:
+            heads = catalog.snapshot_heads()
+        self._cleanup_heads = {
+            event.event_key: self._cleanup_heads[event.event_key]
+            for event in events if event.event_key in self._cleanup_heads
+        }
+        turns: dict[str, tuple[Turn, ...]] = {}
+        # 2. Unrelated sessions do not trigger reads; each changed session is projected once.
+        for event in events:
             if event.thread_id is None or event.input_message_id is None:
                 continue
-            try:
-                messages = catalog.reader(event.thread_id).snapshot()
-            except (KeyError, ValueError):
+            head = heads.get(event.thread_id)
+            if head is None or self._cleanup_heads.get(event.event_key) == head:
                 continue
+            if event.thread_id not in turns:
+                try:
+                    messages = catalog.reader(event.thread_id).snapshot(through_seq=head)
+                except (KeyError, ValueError):
+                    continue
+                turns[event.thread_id] = projection.project(messages, "programmatic")
             turn = next((
-                turn for turn in projection.project(messages, "programmatic")
+                turn for turn in turns[event.thread_id]
                 if event.input_message_id in turn.message_ids
             ), None)
             if turn is None or turn.status == "open":
+                self._cleanup_heads[event.event_key] = head
                 continue
+            # 3. Failed deletion must remain dispatched so restart can retry it.
             if not checkouts.cleanup(event.operation_id):
                 logger.debug("github-watch checkout already absent event=%s", event.event_key)
             ledger.transition(event.event_key, expected=("dispatched",), status="completed")
+            self._cleanup_heads.pop(event.event_key, None)
 
     def authorize(self, operation_id: str, session_id: str, *, code: bool = False) -> EventState:
         ledger, _, _, _ = self.bind()
