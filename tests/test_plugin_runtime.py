@@ -280,7 +280,23 @@ async def test_real_manager_message_tool_db_uses_local_github_endpoint(
             try:
                 await restarted.load_all()
                 await restarted.start_runtime()
-                await asyncio.sleep(0)
+                restart_root = restarted.live_root
+                assert restart_root is not None
+                restart_catalog = restart_root.context.require(TOOLS)
+                restart_menu = await restart_root.context.require(TOOL_PROGRAM).create_menu(
+                    log.reader(session_id),
+                    "programmatic",
+                    content={"text": check_text},
+                    check_start=lambda: None,
+                    authorize=allow,
+                    view=restart_catalog.view(
+                        restart_root.context.require(ALL_TOOLS)().select(
+                            "github_watch_post_comment"
+                        )
+                    ),
+                )
+                replayed = await restart_menu.execute(ref)
+                assert replayed == result
                 assert ledger.get_event(event.event_key).status == "completed"
                 comments = [
                     row for row in writes
