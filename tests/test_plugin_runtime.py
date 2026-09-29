@@ -15,16 +15,20 @@ from typing import cast
 
 import pytest
 
-from agent.plugin_composition.bindings import Bindings
-from agent.plugins.snapshot import lease_runtime_snapshot
+from agent.plugin_composition.config_input import save_config
+from agent.plugins.manager import PluginManager
+from bus.event_bus import EventBus
+from infra.channels.artifacts import ChannelAttachmentArtifactStore
+from session.artifact_store import ArtifactStore
+from agent.plugin_composition.models import ToolCall as ModelToolCall
+from agent.plugin_contracts.tools import TOOL_PROGRAM
 from plugins.content.plugin import check_text
 from plugins.programmatic.control import AdmitParams, PROGRAMMATIC, SendParams
-from plugins.tools.api import MessageReply, result_message_id
 from plugins.tools.plugin import TOOLS, ALL_TOOLS
-from session.message import CallRef, ContentPart, Output, ToolCall, ToolResult
+from session.message import CallRef, ContentPart, Output, ToolCall
 from tests.test_default_reply import application
 
-from github_watch_test_package.ledger import EventLedger
+from github_watch_test_package.ledger import EventLedger  # pyright: ignore[reportMissingImports]
 
 
 def _static_identity(root: Path) -> tuple[dict[str, object], dict[str, object]]:
@@ -63,7 +67,7 @@ def test_static_manifest_matches_message_runtime_entrypoint() -> None:
 class _ApiHandler(BaseHTTPRequestHandler):
     writes: list[tuple[str, str, dict[str, object]]] = []
 
-    def log_message(self, _format: str, *_args: object) -> None:
+    def log_message(self, format: str, *_args: object) -> None:
         pass
 
     def _send(self, value: object, status: int = 200) -> None:
@@ -134,22 +138,29 @@ def _install_sources(sources: Path, plugin_root: Path, api: str, tmp_path: Path)
         ["openssl", "genpkey", "-algorithm", "RSA", "-pkeyopt", "rsa_keygen_bits:2048", "-out", str(pem)],
         check=True, capture_output=True,
     )
-    config = tmp_path / "workspace/plugin-data/github-watch-builtin/config.local.toml"
-    config.parent.mkdir(parents=True, exist_ok=True)
-    config.write_text(
-        f'app_id = 1\ninstallation_id = 2\npem_path = {str(pem)!r}\n'
-        'repositories = ["owner/repo"]\npoll_seconds = 15\n',
-        encoding="utf-8",
+    save_config(
+        tmp_path / "workspace/plugin-data/github-watch-builtin",
+        {
+            "app_id": 1,
+            "installation_id": 2,
+            "pem_path": str(pem),
+            "repositories": ["owner/repo"],
+            "poll_seconds": 15,
+        },
     )
 
 
 @pytest.mark.asyncio
-async def test_real_manager_message_tool_db_and_restart_use_local_github_endpoint(
+async def test_real_manager_message_tool_db_uses_local_github_endpoint(
     tmp_path: Path,
 ) -> None:
     plugin_root = Path(__file__).parents[1]
     with _local_api() as (api, writes):
+        source_root: Path | None = None
+
         def add_sources(sources: Path) -> None:
+            nonlocal source_root
+            source_root = sources
             _install_sources(sources, plugin_root, api, tmp_path)
 
         async with application(
@@ -166,16 +177,16 @@ async def test_real_manager_message_tool_db_and_restart_use_local_github_endpoin
             )
             assert event is not None
             input_id = "github-watch:" + event.operation_id
-            async with lease_runtime_snapshot(host.snapshot_store) as snapshot:
-                root = snapshot.composition_root
-                programmatic = root.context.require(PROGRAMMATIC)
-                _ = await programmatic.call(
-                    "programmatic/session/admit", AdmitParams(session_id=session_id),
-                )
-                _ = await programmatic.call(
-                    "programmatic/message/send",
-                    SendParams(session_id=session_id, message_id=input_id, text="review issue"),
-                )
+            root = host.live_root
+            assert root is not None
+            programmatic = root.context.require(PROGRAMMATIC)
+            _ = await programmatic.call(
+                "programmatic/session/admit", AdmitParams(session_id=session_id),
+            )
+            _ = await programmatic.call(
+                "programmatic/message/send",
+                SendParams(session_id=session_id, message_id=input_id, text="review issue"),
+            )
             for before, after in (
                 ("discovered", "claimed"), ("claimed", "context_ready"),
                 ("context_ready", "message_submitting"),
@@ -191,36 +202,46 @@ async def test_real_manager_message_tool_db_and_restart_use_local_github_endpoin
             ledger.set_thread("owner/repo", "issue", 1, session_id)
 
             await host.start_runtime()
-            bindings = Bindings(log, host._archive, host.open_binding)
-            async with lease_runtime_snapshot(host.snapshot_store) as snapshot:
-                catalog = snapshot.composition_root.context.require(TOOLS)
-                binding = catalog.bind(snapshot.composition_root.context.require(ALL_TOOLS)().select("github_watch_post_comment"), bindings)
-                call_writer = log.writer(
-                    session_id, author="assistant", source="programmatic",
-                    body_types=(Output,), content={}, check_call=lambda _call: None,
-                )
-                call_writer.append(
+            root = host.live_root
+            assert root is not None
+            catalog = root.context.require(TOOLS)
+            async def allow(_binding: str, _arguments: object):
+                return {"allowed": True}
+
+            menu = await root.context.require(TOOL_PROGRAM).create_menu(
+                log.reader(session_id),
+                "programmatic",
+                content={"text": check_text},
+                check_start=lambda: None,
+                authorize=allow,
+                view=catalog.view(
+                    root.context.require(ALL_TOOLS)().select(
+                        "github_watch_post_comment"
+                    )
+                ),
+            )
+            decoded = menu.decode(
+                ModelToolCall(
                     "github-call",
-                    Output((ToolCall(binding, {
-                        "operation_id": event.operation_id, "body": "local review result",
-                    }),), "continue"),
+                    "github_watch_post_comment",
+                    {"operation_id": event.operation_id, "body": "local review result"},
                 )
-                ref = CallRef("github-call", 0)
-                result_writer = log.writer(
-                    session_id, author="tool", source="programmatic",
-                    body_types=(ToolResult,), content={"text": check_text}, call_ref=ref,
-                )
-                reply = MessageReply(
-                    result_message_id(ref), ref, log.reader(session_id), result_writer,
-                    lambda: None,
-                )
-
-                async def allow(_binding: str, _arguments: object):
-                    return {"allowed": True}
-
-                execution = catalog.execution(allow)
-                result = await execution.execute_call(reply)
-                repeated = await execution.execute_call(reply)
+            )
+            assert decoded.binding_id is not None
+            binding = decoded.binding_id
+            call_writer = log.writer(
+                session_id, author="assistant", source="programmatic",
+                body_types=(Output,), content={}, check_call=menu.check_call,
+            )
+            call_writer.append(
+                "github-call",
+                Output((ToolCall(binding, {
+                    "operation_id": event.operation_id, "body": "local review result",
+                }),), "continue"),
+            )
+            ref = CallRef("github-call", 0)
+            result = await menu.execute(ref)
+            repeated = await menu.execute(ref)
             assert result.outcome == "success"
             assert repeated == result
             comments = [row for row in writes if row[1].endswith("/issues/1/comments")]
@@ -236,9 +257,53 @@ async def test_real_manager_message_tool_db_and_restart_use_local_github_endpoin
                 while ledger.get_event(event.event_key).status != "completed":
                     await asyncio.sleep(0)
 
-            await host.terminate_all()
-            await host.load_all()
-            await host.start_runtime()
-            await asyncio.sleep(0)
             assert ledger.get_event(event.event_key).status == "completed"
             assert len([row for row in writes if row[1].endswith("/issues/1/comments")]) == 1
+
+            # A stopped Manager cannot reopen its own Root. Reuse the persisted
+            # selection and Message log through a fresh Manager instead.
+            await host.terminate_all()
+            assert source_root is not None
+            restart_bus = EventBus()
+            restart_metadata = ArtifactStore(tmp_path / "sessions.db")
+            restart_artifacts = ChannelAttachmentArtifactStore(
+                workspace=tmp_path / "workspace", metadata_store=restart_metadata,
+            )
+            restarted = PluginManager(
+                [source_root],
+                event_bus=restart_bus,
+                workspace=tmp_path / "workspace",
+                installed_cache_root=tmp_path / "home/cache",
+                message_log=log,
+                channel_attachment_store=restart_artifacts,
+            )
+            try:
+                await restarted.load_all()
+                await restarted.start_runtime()
+                restart_root = restarted.live_root
+                assert restart_root is not None
+                restart_catalog = restart_root.context.require(TOOLS)
+                restart_menu = await restart_root.context.require(TOOL_PROGRAM).create_menu(
+                    log.reader(session_id),
+                    "programmatic",
+                    content={"text": check_text},
+                    check_start=lambda: None,
+                    authorize=allow,
+                    view=restart_catalog.view(
+                        restart_root.context.require(ALL_TOOLS)().select(
+                            "github_watch_post_comment"
+                        )
+                    ),
+                )
+                replayed = await restart_menu.execute(ref)
+                assert replayed == result
+                assert ledger.get_event(event.event_key).status == "completed"
+                comments = [
+                    row for row in writes
+                    if row[1].endswith("/issues/1/comments")
+                ]
+                assert len(comments) == 1
+            finally:
+                await restarted.terminate_all()
+                restart_metadata.close()
+                await restart_bus.aclose()
