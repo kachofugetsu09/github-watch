@@ -21,7 +21,7 @@ from bus.event_bus import EventBus
 from infra.channels.artifacts import ChannelAttachmentArtifactStore
 from session.artifact_store import ArtifactStore
 from agent.plugin_composition.models import ToolCall as ModelToolCall
-from agent.plugin_contracts.tools import TOOL_PROGRAM
+from agent.plugin_contracts.tools import TOOL_PROGRAM_V2 as TOOL_PROGRAM
 from plugins.content.plugin import check_text
 from plugins.programmatic.control import AdmitParams, PROGRAMMATIC, SendParams
 from plugins.tools.plugin import TOOLS, ALL_TOOLS
@@ -212,7 +212,7 @@ async def test_real_manager_message_tool_db_uses_local_github_endpoint(
                 log.reader(session_id),
                 "programmatic",
                 content={"text": check_text},
-                check_start=lambda: None,
+                check_start=lambda _transaction: None,
                 authorize=allow,
                 view=catalog.view(
                     root.context.require(ALL_TOOLS)().select(
@@ -287,7 +287,7 @@ async def test_real_manager_message_tool_db_uses_local_github_endpoint(
                     log.reader(session_id),
                     "programmatic",
                     content={"text": check_text},
-                    check_start=lambda: None,
+                    check_start=lambda _transaction: None,
                     authorize=allow,
                     view=restart_catalog.view(
                         restart_root.context.require(ALL_TOOLS)().select(
