@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import sqlite3
 import uuid
+from collections.abc import Iterator
+from contextlib import closing, contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -403,7 +405,10 @@ class EventLedger:
         if "input_message_id" not in event_columns:
             connection.execute("ALTER TABLE events ADD COLUMN input_message_id TEXT")
 
-    def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.path, timeout=10)
-        connection.execute("PRAGMA foreign_keys = ON")
-        return connection
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
+        """让一次实际调用同时拥有原事务提交/回滚和连接关闭。"""
+        with closing(sqlite3.connect(self.path, timeout=10)) as connection:
+            with connection:
+                connection.execute("PRAGMA foreign_keys = ON")
+                yield connection

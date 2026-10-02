@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import json
 import logging
 import re
 from pathlib import Path
 from typing import Any, Protocol
+
+from core.common.file_io import run_file_io
 
 from .context_bundle import ContextBundle
 from .checkout import CheckoutManager
@@ -30,6 +31,14 @@ def _session_id(event: EventState) -> str:
 
 def _input_message_id(event: EventState) -> str:
     return "github-watch:" + event.operation_id
+
+
+def _read_item(manifest: Path) -> dict[str, Any]:
+    """完整读取证据文件并校验原对象边界，避免文件和解码占用 loop。"""
+    item = json.loads((manifest.parent / "item.json").read_text(encoding="utf-8"))
+    if not isinstance(item, dict):
+        raise TypeError("github-watch item evidence is not an object")
+    return item
 
 
 class ProgrammaticMessagePort(Protocol):
@@ -77,14 +86,14 @@ class GitHubWatch:
         """Poll repositories serially, then append each newly discovered Input once."""
 
         # 1. Recover checkout storage before reading new remote state.
-        removed = await asyncio.to_thread(self._checkouts.sweep)
+        removed = await run_file_io(self._checkouts.sweep)
         if removed:
             logger.warning("github-watch swept expired checkouts count=%d", removed)
 
         # 2. Discover events and advance observation cursors
         for repo in repositories:
             try:
-                await asyncio.to_thread(self._discover_repository, repo)
+                await run_file_io(lambda: self._discover_repository(repo))
             except GitHubTransportUnavailable as exc:
                 if exc.attempts > 0:
                     logger.warning(
@@ -104,7 +113,7 @@ class GitHubWatch:
                 return
 
         # 3. Run only durable events that have not admitted their Input Message.
-        for event in self._ledger.pending_events():
+        for event in await run_file_io(self._ledger.pending_events):
             await self._process_event(event, messages)
 
     def _discover_repository(self, repo: str) -> None:
@@ -216,23 +225,21 @@ class GitHubWatch:
     ) -> None:
         """Build local evidence, then admit one idempotent programmatic Message."""
 
-        self._ledger.transition(
+        await run_file_io(lambda: self._ledger.transition(
             event.event_key, expected=("discovered",), status="claimed"
-        )
+        ))
         try:
-            manifest = await asyncio.to_thread(self._context.build, event)
-            item = json.loads((manifest.parent / "item.json").read_text(encoding="utf-8"))
-            if not isinstance(item, dict):
-                raise TypeError("github-watch item evidence is not an object")
-            checkout = await asyncio.to_thread(self._checkouts.prepare, event, item)
+            manifest = await run_file_io(lambda: self._context.build(event))
+            item = await run_file_io(lambda: _read_item(manifest))
+            checkout = await run_file_io(lambda: self._checkouts.prepare(event, item))
         except GitHubTransportUnavailable as exc:
-            await asyncio.to_thread(self._checkouts.cleanup, event.operation_id)
-            self._ledger.transition(
+            await run_file_io(lambda: self._checkouts.cleanup(event.operation_id))
+            await run_file_io(lambda: self._ledger.transition(
                 event.event_key,
                 expected=("claimed",),
                 status="discovered",
                 error=repr(exc),
-            )
+            ))
             logger.warning(
                 "github-watch context paused by GitHub transport cooldown; "
                 "retry next poll event=%s retry_at=%.3f",
@@ -241,40 +248,47 @@ class GitHubWatch:
             )
             return
         except Exception as exc:
-            await asyncio.to_thread(self._checkouts.cleanup, event.operation_id)
-            self._ledger.transition(
+            await run_file_io(lambda: self._checkouts.cleanup(event.operation_id))
+            await run_file_io(lambda: self._ledger.transition(
                 event.event_key,
                 expected=("claimed",),
                 status="discovered",
                 error=repr(exc),
-            )
+            ))
             logger.exception(
                 "github-watch context failed safely; retry next poll event=%s",
                 event.event_key,
             )
             return
-        self._ledger.transition(
+        await run_file_io(lambda: self._ledger.transition(
             event.event_key,
             expected=("claimed",),
             status="context_ready",
             artifact_id=str(manifest),
-        )
+        ))
 
         try:
             await self._dispatch_message(event, manifest, checkout.path, messages)
         except BaseException as error:
-            current = self._ledger.get_event(event.event_key)
-            if current.status == "message_submitting":
-                self._ledger.transition(
-                    event.event_key, expected=("message_submitting",),
-                    status="discovered", error=repr(error),
-                )
+            try:
+                current = await run_file_io(lambda: self._ledger.get_event(event.event_key))
+                if current.status == "message_submitting":
+                    await run_file_io(lambda: self._ledger.transition(
+                        event.event_key, expected=("message_submitting",),
+                        status="discovered", error=repr(error),
+                    ))
+            except BaseException as recovery_error:
+                # 恢复也可能被取消或写锁失败，不能覆盖已经发生的提交失败。
+                raise BaseExceptionGroup(
+                    "GitHub Watch 提交回执恢复失败", [error, recovery_error],
+                ) from None
             raise
+        current = await run_file_io(lambda: self._ledger.get_event(event.event_key))
         logger.info(
             "github-watch dispatched event=%s session=%s input=%s",
             event.event_key,
-            self._ledger.get_event(event.event_key).thread_id,
-            self._ledger.get_event(event.event_key).input_message_id,
+            current.thread_id,
+            current.input_message_id,
         )
 
     async def _dispatch_message(
@@ -287,44 +301,45 @@ class GitHubWatch:
         """Append one stable programmatic Input and return after Message admission."""
 
         # 1. 复用每个 Issue/PR 的稳定 Session，首次创建后先持久化 identity。
-        item = self._ledger.get_item(event.repo, event.kind, event.number)
+        item = await run_file_io(lambda: self._ledger.get_item(event.repo, event.kind, event.number))
         if item is None:
             raise RuntimeError(f"event item missing: {event.event_key}")
         session_id = _session_id(event)
         await messages.admit(session_id)
         if item.thread_id != session_id:
-            self._ledger.set_thread(event.repo, event.kind, event.number, session_id)
+            await run_file_io(lambda: self._ledger.set_thread(event.repo, event.kind, event.number, session_id))
 
         # 2. 在不确定提交边界之前完成纯本地 prompt 构建。
         prompt = self._build_prompt(event, manifest, checkout_path)
 
         # 3. 先保存本地意图；相同 Message identity 的重试由 Core 验证正文相同。
         input_message_id = _input_message_id(event)
-        self._ledger.transition(
+        await run_file_io(lambda: self._ledger.transition(
             event.event_key,
             expected=("context_ready",),
             status="message_submitting",
             thread_id=session_id,
             input_message_id=input_message_id,
-        )
+        ))
         accepted = await messages.submit(session_id, input_message_id, prompt)
         if accepted != input_message_id:
             raise RuntimeError("programmatic Message receipt identity mismatch")
-        self._ledger.transition(
+        await run_file_io(lambda: self._ledger.transition(
             event.event_key,
             expected=("message_submitting",),
             status="dispatched",
             input_message_id=input_message_id,
-        )
+        ))
         await self._ack_dispatched(event)
 
     async def _ack_dispatched(self, event: EventState) -> None:
         """React with :eyes: on the item itself once a turn has been admitted."""
 
-        if self._operations is None:
+        operations = self._operations
+        if operations is None:
             return
         try:
-            await asyncio.to_thread(self._operations.react, event, "eyes")
+            await run_file_io(lambda: operations.react(event, "eyes"))
         except (GitHubApiError, GitHubTransportUnavailable, OSError):
             logger.warning(
                 "github-watch ack reaction failed event=%s", event.event_key, exc_info=True

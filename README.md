@@ -17,6 +17,12 @@ Akashic API v3 插件。它轮询 GitHub，把可处理事件作为 programmatic
 
 插件只注入通用 `TIMERS`、`PROGRAMMATIC`、`MESSAGE_CATALOG`、`TURN_PROJECTION` 和 `TOOLS` 能力。候选 generation 的 `apply` 只登记生命周期和 Tool，不打开 PEM、数据库或网络；正式 Root 启动后才创建客户端、账本和后台循环。
 
+账本打开、完整事务、关闭与后台文件/Git/HTTP 工作使用 Core 的有界执行路径，避免 SQLite 锁等待阻塞共享 loop。取消或 generation 停止等待已开始的物理工作结束；数据库连接不跨线程或 await，发送意图仍在 programmatic Input 提交之前耐久保存，远端效果按原 operation marker 恢复。没有新增 schema、写队列或历史清理。
+
+若提交失败后的账本恢复也失败或被取消，两份错误一起向调用者传播；不会把已追加 Message 的不确定提交隐藏成普通取消。
+
+可用 `AKASHIC_AGENT_ROOT=/path/to/core PYTHONPATH=/path/to/core python scripts/check_ledger_io.py` 检查临时真实 Manager/MessageLog 的锁等待、取消、停止与重开身份；脚本不运行模型或发送 GitHub 请求。
+
 ## Tool
 
 - `github_watch_runtime_info`

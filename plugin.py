@@ -18,6 +18,7 @@ from agent.plugin_composition import Context, RUNTIME_STARTED, RUNTIME_STOPPING,
 from agent.plugin_composition.messages import MESSAGE_CATALOG, MessageCatalog
 from agent.plugin_composition.timers import TIMERS
 from agent.plugin_contracts import ContentPart, Input, json_value
+from core.common.file_io import run_file_io
 
 from .contracts import (
     AdmitParams, BoundTool, CallSource, InvalidArguments, PROGRAMMATIC,
@@ -130,20 +131,30 @@ class Runtime:
         self._ctx = ctx
         self._config = config
         self._bound: tuple[EventLedger, CheckoutManager, GitHubOperations, GitHubWatch] | None = None
+        self._bind_lock = asyncio.Lock()
         self._cleanup_lock = asyncio.Lock()
         self._cleanup_heads: dict[str, int] = {}
 
-    def bind(self) -> tuple[EventLedger, CheckoutManager, GitHubOperations, GitHubWatch]:
-        """Open plugin state and external clients only inside the formal runtime."""
+    async def bind(self) -> tuple[EventLedger, CheckoutManager, GitHubOperations, GitHubWatch]:
+        """在正式 loop 取得路径，实际状态打开和恢复结束后才发布本代资源。"""
         if self._bound is not None:
             return self._bound
-        data_dir = self._ctx.data_root
+        async with self._bind_lock:
+            if self._bound is None:
+                data_dir = self._ctx.data_root
+                self._bound = await run_file_io(lambda: self._open(data_dir))
+            return self._bound
+
+    def _open(self, data_dir: Path) -> tuple[EventLedger, CheckoutManager, GitHubOperations, GitHubWatch]:
+        """在同一物理工作内打开账本并完成原恢复，不访问 Context。"""
+        # 1. 原恢复先于任何 poll 或 Tool 使用本代账本。
         data_dir.mkdir(parents=True, exist_ok=True)
         ledger = EventLedger(data_dir / "events.sqlite3")
         ledger.integrity_check()
         recovered = ledger.recover_interrupted()
         if any(recovered.values()):
             logger.warning("github-watch recovered interrupted states: %s", recovered)
+        # 2. 构造本代客户端与来源，完整结果交回 loop 后发布。
         client = GitHubClient(
             app_id=self._config.app_id,
             installation_id=self._config.installation_id,
@@ -160,12 +171,11 @@ class Runtime:
             operations=operations, notify_channel=self._config.notify_channel,
             notify_chat_id=self._config.notify_chat_id,
         )
-        self._bound = (ledger, checkouts, operations, watch)
-        return self._bound
+        return ledger, checkouts, operations, watch
 
     async def run(self) -> None:
         """Poll and cleanup in independent loops owned by the same generation Fiber."""
-        self.bind()
+        await self.bind()
         async with asyncio.TaskGroup() as group:
             _ = group.create_task(self._poll_loop(), name="github-watch:poll")
             _ = group.create_task(self._cleanup_loop(), name="github-watch:cleanup")
@@ -174,7 +184,7 @@ class Runtime:
         while True:
             try:
                 async with self._ctx.runtime_scope():
-                    _, _, _, watch = self.bind()
+                    _, _, _, watch = await self.bind()
                     await watch.poll(
                         self._config.repositories,
                         _ProgrammaticMessages(self._ctx.require(PROGRAMMATIC)),
@@ -213,26 +223,19 @@ class Runtime:
         heads: Mapping[str, int] | None = None,
     ) -> None:
         """Check changed prefixes off-loop and finish started work before scope teardown."""
-        self.bind()
+        ledger, checkouts, _, _ = await self.bind()
         # 1. Poll and Message wakes share one worker and one bounded progress map.
         async with self._cleanup_lock:
-            job = asyncio.create_task(asyncio.to_thread(self._cleanup_completed, catalog, projection, heads))
-            cancelled = False
-            while not job.done():
-                try:
-                    await asyncio.shield(job)
-                except asyncio.CancelledError:
-                    cancelled = True
-            job.result()
-            if cancelled:
-                raise asyncio.CancelledError
+            await run_file_io(lambda: self._cleanup_completed(
+                catalog, projection, heads, ledger=ledger, checkouts=checkouts,
+            ))
 
     def _cleanup_completed(
         self, catalog: MessageCatalog, projection: TurnProjection,
         heads: Mapping[str, int] | None,
+        *, ledger: EventLedger, checkouts: CheckoutManager,
     ) -> None:
         """Delete completed checkouts before settling their durable event records."""
-        ledger, checkouts, _, _ = self.bind()
         events = ledger.dispatched_events()
         if heads is None:
             heads = catalog.snapshot_heads()
@@ -267,28 +270,35 @@ class Runtime:
             ledger.transition(event.event_key, expected=("dispatched",), status="completed")
             self._cleanup_heads.pop(event.event_key, None)
 
-    def authorize(self, operation_id: str, session_id: str, *, code: bool = False) -> EventState:
-        ledger, _, _, _ = self.bind()
-        event = ledger.get_event_by_operation(operation_id)
+    async def authorize(self, operation_id: str, session_id: str, *, code: bool = False) -> EventState:
+        """从耐久账本读取归属，再在普通 Tool 边界核对本次来源。"""
+        ledger, _, _, _ = await self.bind()
+        event = await run_file_io(lambda: ledger.get_event_by_operation(operation_id))
         if event.status not in {"message_submitting", "dispatched"} or event.thread_id != session_id:
             raise PermissionError("operation does not belong to the current programmatic Session")
         if code and event.trigger_kind != "owner_mention":
             raise PermissionError("code changes require an owner mention event")
         return event
 
-    def operation(self, action: str, event: EventState, arguments: Mapping[str, object]) -> object:
-        _, _, operations, _ = self.bind()
-        if action == "post_comment":
-            return operations.post_comment(event, cast(str, arguments["body"]))
-        if action == "submit_review":
-            return operations.submit_review(event, cast(str, arguments["body"]))
-        if action == "push_branch":
-            return operations.push_branch(event, cast(str, arguments["branch_suffix"]))
-        if action == "create_pr":
-            return operations.create_pull(
-                event, title=cast(str, arguments["title"]), body=cast(str, arguments["body"]),
-            )
-        raise AssertionError(action)
+    async def operation(self, action: str, event: EventState, arguments: Mapping[str, object]) -> object:
+        """等原 GitHub 物理操作结束再释放 Tool scope，不伪装远端效果回滚。"""
+        _, _, operations, _ = await self.bind()
+
+        def work() -> object:
+            """执行已校验的原 operation，保留远端重试和 marker 规则。"""
+            if action == "post_comment":
+                return operations.post_comment(event, cast(str, arguments["body"]))
+            if action == "submit_review":
+                return operations.submit_review(event, cast(str, arguments["body"]))
+            if action == "push_branch":
+                return operations.push_branch(event, cast(str, arguments["branch_suffix"]))
+            if action == "create_pr":
+                return operations.create_pull(
+                    event, title=cast(str, arguments["title"]), body=cast(str, arguments["body"]),
+                )
+            raise AssertionError(action)
+
+        return await run_file_io(work)
 
 
 class GitHubTool(BoundTool):
@@ -314,7 +324,7 @@ class GitHubTool(BoundTool):
             raise InvalidArguments("GitHub 写操作需要实际 Message 调用来源")
         session_id = source.messages[-1].session_id
         operation_id = cast(str, request.operation_id)
-        event = self._runtime.authorize(
+        event = await self._runtime.authorize(
             operation_id, session_id,
             code=self._action in {"push_branch", "create_pr"},
         )
@@ -338,11 +348,11 @@ class GitHubTool(BoundTool):
             operation_id = arguments.get("operation_id")
             if not isinstance(session_id, str) or not isinstance(operation_id, str):
                 raise ValueError("prepared GitHub operation identity is invalid")
-            event = self._runtime.authorize(
+            event = await self._runtime.authorize(
                 operation_id, session_id,
                 code=self._action in {"push_branch", "create_pr"},
             )
-            value = await asyncio.to_thread(self._runtime.operation, self._action, event, arguments)
+            value = await self._runtime.operation(self._action, event, arguments)
         return Result("success", (ContentPart("text", json.dumps(value, ensure_ascii=False, sort_keys=True)),))
 
     async def query(self, key: str) -> Result | None:
@@ -398,7 +408,7 @@ async def apply(ctx: Context) -> None:
 
     async def start(_event: object) -> None:
         nonlocal watcher
-        runtime.bind()
+        await runtime.bind()
         watcher = await ctx.spawn(runtime.run(), name="github-watch")
 
     async def stop(_event: object) -> None:
