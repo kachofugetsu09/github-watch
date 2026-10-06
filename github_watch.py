@@ -385,6 +385,8 @@ class GitHubWatch:
 你处在这个 Issue/PR 的稳定专用 Session 中，上一次评论和完整历史都在该 Session 与本次证据包中。
 先读 manifest 和全部证据，再只在临时仓库中读取、测试或修改，以新鲜 GitHub 证据为准。{permission}
 禁止使用系统 gh、个人 GitHub 凭证或直接 git push；所有 GitHub 写操作必须使用 github_watch_* 工具，
+先从 system 插件目录找到 github-watch 的准确插件 ID，调用 load_tools 读取完整 schema，
+再用 tool_call 的 name 和 arguments 调用对应 github_watch_* 工具。
 这些工具会绑定当前 operation、仓库和 Bot installation identity。{delivery}
 {pull_request_contract}
 {notification}

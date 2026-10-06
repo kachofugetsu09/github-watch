@@ -377,7 +377,7 @@ def _definitions() -> tuple[tuple[str, str, Mapping[str, object], str], ...]:
 
 api_version = 3
 name = "github-watch"
-version = "4.0.0"
+version = "4.0.1"
 desc = "轮询 GitHub，以 programmatic Message 启动工作并提供受约束的 GitHub 工具。"
 inject = (TIMERS, PROGRAMMATIC, MESSAGE_CATALOG, TURN_PROJECTION, TOOLS)
 
@@ -390,7 +390,7 @@ async def apply(ctx: Context) -> None:
     config = GitHubWatchConfig.model_validate(ctx.config)
     runtime = Runtime(ctx, config)
     catalog = ctx.require(TOOLS)
-    await catalog.declare_group(ctx, always_on=True, description=desc)
+    await catalog.declare_group(ctx, always_on=False, description=desc)
     refs = []
     for tool_name, description, parameters, action in _definitions():
         @asynccontextmanager

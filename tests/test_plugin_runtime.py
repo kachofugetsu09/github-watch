@@ -19,7 +19,7 @@ from bus.event_bus import EventBus
 from infra.channels.artifacts import ChannelAttachmentArtifactStore
 from session.artifact_store import ArtifactStore
 from agent.plugin_composition.models import ToolCall as ModelToolCall
-from agent.plugin_contracts.tools import TOOL_PROGRAM_V2 as TOOL_PROGRAM
+from agent.plugin_contracts.tools import TOOL_LOADING_PRESENTATION, TOOL_PROGRAM_V2 as TOOL_PROGRAM
 from plugins.content.plugin import check_text
 from plugins.programmatic.control import AdmitParams, PROGRAMMATIC, SendParams
 from plugins.tools.plugin import TOOLS, ALL_TOOLS
@@ -91,6 +91,7 @@ def _local_api():
 def _install_sources(sources: Path, plugin_root: Path, api: str, tmp_path: Path) -> None:
     core = Path(os.environ["AKASHIC_AGENT_ROOT"])
     shutil.copytree(core / "plugins/programmatic", sources / "programmatic")
+    shutil.copytree(core / "plugins/tool_search", sources / "tool_search")
     shutil.copytree(
         plugin_root, sources / "github-watch",
         ignore=shutil.ignore_patterns(".git", ".pytest_cache", "__pycache__", "tests"),
@@ -174,6 +175,9 @@ async def test_real_manager_message_tool_db_uses_local_github_endpoint(
             root = host.live_root
             assert root is not None
             catalog = root.context.require(TOOLS)
+            view, presentation = root.context.require(TOOL_LOADING_PRESENTATION)(
+                catalog.view(*root.context.require(ALL_TOOLS)().refs)
+            )
             async def allow(_binding: str, _arguments: object):
                 return {"allowed": True}
 
@@ -183,17 +187,39 @@ async def test_real_manager_message_tool_db_uses_local_github_endpoint(
                 content={"text": check_text},
                 check_start=lambda _transaction: None,
                 authorize=allow,
-                view=catalog.view(
-                    root.context.require(ALL_TOOLS)().select(
-                        "github_watch_post_comment"
-                    )
-                ),
+                view=view,
+                presentation=presentation,
+            )
+            assert not any(
+                schema["function"]["name"].startswith("github_watch_")
+                for schema in menu.schemas
+            )
+            loaded = menu.decode(ModelToolCall(
+                "github-load", "load_tools", {"plugin": "github-watch"},
+            ))
+            assert loaded.binding_id is not None
+            call_writer = log.writer(
+                session_id, author="assistant", source="programmatic",
+                body_types=(Output,), content={}, check_call=menu.check_call,
+            )
+            call_writer.append("github-load", Output((ToolCall(
+                loaded.binding_id, {"plugin": "github-watch"},
+            ),), "continue"))
+            loaded_result = await menu.execute(CallRef("github-load", 0))
+            assert loaded_result.outcome == "success"
+            loaded_tools = json.loads(loaded_result.parts[0].value)["tools"]
+            assert len(loaded_tools) == 5
+            assert all(
+                schema["function"]["name"].startswith("github_watch_")
+                for schema in loaded_tools
             )
             decoded = menu.decode(
                 ModelToolCall(
                     "github-call",
-                    "github_watch_post_comment",
-                    {"operation_id": event.operation_id, "body": "local review result"},
+                    "tool_call",
+                    {"name": "github_watch_post_comment", "arguments": {
+                        "operation_id": event.operation_id, "body": "local review result",
+                    }},
                 )
             )
             assert decoded.binding_id is not None
@@ -252,17 +278,17 @@ async def test_real_manager_message_tool_db_uses_local_github_endpoint(
                 restart_root = restarted.live_root
                 assert restart_root is not None
                 restart_catalog = restart_root.context.require(TOOLS)
+                restart_view, restart_presentation = restart_root.context.require(TOOL_LOADING_PRESENTATION)(
+                    restart_catalog.view(*restart_root.context.require(ALL_TOOLS)().refs)
+                )
                 restart_menu = await restart_root.context.require(TOOL_PROGRAM).create_menu(
                     log.reader(session_id),
                     "programmatic",
                     content={"text": check_text},
                     check_start=lambda _transaction: None,
                     authorize=allow,
-                    view=restart_catalog.view(
-                        restart_root.context.require(ALL_TOOLS)().select(
-                            "github_watch_post_comment"
-                        )
-                    ),
+                    view=restart_view,
+                    presentation=restart_presentation,
                 )
                 replayed = await restart_menu.execute(ref)
                 assert replayed == result

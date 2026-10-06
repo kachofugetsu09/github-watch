@@ -25,6 +25,11 @@ Akashic API v3 插件。它轮询 GitHub，把可处理事件作为 programmatic
 
 ## Tool
 
+这组工具按需加载，不直接出现在默认模型工具菜单中。先从 system 插件目录取得
+`github-watch` 的准确插件 ID（例如 `github-watch@github`），调用 `load_tools` 读取
+完整 schema，再用 `tool_call` 的 `name` 和 `arguments` 调用具体工具。
+GitHub 自动任务也走这条路径；operation 与真实 Message 来源校验仍在调用边界执行。
+
 - `github_watch_runtime_info`
 - `github_watch_post_comment`
 - `github_watch_submit_review`
