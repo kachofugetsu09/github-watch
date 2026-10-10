@@ -15,11 +15,11 @@ import pytest
 
 from agent.plugin_composition.config_input import save_config
 from agent.plugins.manager import PluginManager
-from bus.event_bus import EventBus
 from infra.channels.artifacts import ChannelAttachmentArtifactStore
 from session.artifact_store import ArtifactStore
-from agent.plugin_composition.models import ToolCall as ModelToolCall
-from agent.plugin_contracts.tools import TOOL_LOADING_PRESENTATION, TOOL_PROGRAM_V2 as TOOL_PROGRAM
+from plugins.models.contract import ToolCall as ModelToolCall
+from plugins.tools.contract import TOOL_LOADING_PRESENTATION
+from plugins.tools.contract import TOOL_PROGRAM_V2 as TOOL_PROGRAM
 from plugins.content.plugin import check_text
 from plugins.programmatic.control import AdmitParams, PROGRAMMATIC, SendParams
 from plugins.tools.plugin import TOOLS, ALL_TOOLS
@@ -91,6 +91,8 @@ def _local_api():
 def _install_sources(sources: Path, plugin_root: Path, api: str, tmp_path: Path) -> None:
     core = Path(os.environ["AKASHIC_AGENT_ROOT"])
     shutil.copytree(core / "plugins/programmatic", sources / "programmatic")
+    shutil.copytree(core / "plugins/gateway", sources / "gateway")
+    shutil.copytree(core / "plugins/timer", sources / "timer")
     shutil.copytree(core / "plugins/tool_search", sources / "tool_search")
     shutil.copytree(
         plugin_root, sources / "github-watch",
@@ -259,14 +261,13 @@ async def test_real_manager_message_tool_db_uses_local_github_endpoint(
             # selection and Message log through a fresh Manager instead.
             await host.terminate_all()
             assert source_root is not None
-            restart_bus = EventBus()
+
             restart_metadata = ArtifactStore(tmp_path / "sessions.db")
             restart_artifacts = ChannelAttachmentArtifactStore(
                 workspace=tmp_path / "workspace", metadata_store=restart_metadata,
             )
             restarted = PluginManager(
                 [source_root],
-                event_bus=restart_bus,
                 workspace=tmp_path / "workspace",
                 installed_cache_root=tmp_path / "home/cache",
                 message_log=log,
@@ -301,4 +302,3 @@ async def test_real_manager_message_tool_db_uses_local_github_endpoint(
             finally:
                 await restarted.terminate_all()
                 restart_metadata.close()
-                await restart_bus.aclose()
