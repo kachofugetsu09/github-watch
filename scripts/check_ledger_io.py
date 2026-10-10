@@ -20,7 +20,6 @@ from types import ModuleType, SimpleNamespace
 from typing import Any
 
 from agent.plugins.manager import PluginManager
-from bus.event_bus import EventBus
 from infra.channels.artifacts import ChannelAttachmentArtifactStore
 from session.artifact_store import ArtifactStore
 from session.message import Input
@@ -297,10 +296,10 @@ async def scenario(plugin: Any, kind: str, expect_blocking: bool,
             # 3. 新 Manager 读取同一日志；重试只用原身份和正文，已 dispatched 不重发。
             await host.terminate_all()
             assert source_root is not None
-            bus = EventBus()
+
             metadata = ArtifactStore(root / "sessions.db")
             artifacts = ChannelAttachmentArtifactStore(workspace=root / "workspace", metadata_store=metadata)
-            reopened = PluginManager([source_root], event_bus=bus, workspace=root / "workspace",
+            reopened = PluginManager([source_root], workspace=root / "workspace",
                                      installed_cache_root=root / "home/cache", message_log=log,
                                      channel_attachment_store=artifacts)
             try:
@@ -335,7 +334,7 @@ async def scenario(plugin: Any, kind: str, expect_blocking: bool,
             finally:
                 await reopened.terminate_all()
                 metadata.close()
-                await bus.aclose()
+
             return receipts
 
 

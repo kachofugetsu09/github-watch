@@ -14,9 +14,10 @@ from typing import Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
-from agent.plugin_composition import Context, RUNTIME_STARTED, RUNTIME_STOPPING, ServiceKey, TimerStatus
+from agent.plugin_composition import Context, RUNTIME_STARTED, RUNTIME_STOPPING, ServiceKey
+from plugins.timer.contract import TimerStatus
 from agent.plugin_composition.messages import MESSAGE_CATALOG, MessageCatalog
-from agent.plugin_composition.timers import TIMERS
+from plugins.timer.contract import TIMERS
 from agent.plugin_contracts import ContentPart, Input, json_value
 from core.common.file_io import run_file_io
 
@@ -377,7 +378,7 @@ def _definitions() -> tuple[tuple[str, str, Mapping[str, object], str], ...]:
 
 api_version = 3
 name = "github-watch"
-version = "4.0.1"
+version = "4.0.2"
 desc = "轮询 GitHub，以 programmatic Message 启动工作并提供受约束的 GitHub 工具。"
 inject = (TIMERS, PROGRAMMATIC, MESSAGE_CATALOG, TURN_PROJECTION, TOOLS)
 
