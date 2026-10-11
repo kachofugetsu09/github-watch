@@ -1,0 +1,36 @@
+name: Provider contracts
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: kachofugetsu09/akashic-agent
+          ref: 1a5327e495153c2b42d501ba42b671fafb2267f4
+          path: .akashic-core
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install exact Core dependencies
+        run: python -m pip install -r .akashic-core/requirements.txt -r .akashic-core/requirements-dev.txt
+      - name: Verify real plugin and durable delivery
+        env:
+          AKASHIC_AGENT_ROOT: ${{ github.workspace }}/.akashic-core
+          PYTHONPATH: ${{ github.workspace }}:${{ github.workspace }}/.akashic-core:${{ github.workspace }}/.akashic-core/sdk/python/src
+        run: |
+          python -m pytest -q tests
+          python scripts/check_ledger_io.py
+          pyright --level error plugin.py
+      - name: Check diff
+        run: git diff --check

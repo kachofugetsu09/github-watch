@@ -16,16 +16,14 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 
 from agent.plugin_composition import Context, RUNTIME_STARTED, RUNTIME_STOPPING, ServiceKey
 from plugins.timer.contract import TimerStatus
-from agent.plugin_composition.messages import MESSAGE_CATALOG, MessageCatalog
+from plugins.ledger.contract import MESSAGE_CATALOG, MessageCatalog
 from plugins.timer.contract import TIMERS
-from agent.plugin_contracts import ContentPart, Input, json_value
+from plugins.ledger.contract import ContentPart, Input, json_value
 from core.common.file_io import run_file_io
 
-from .contracts import (
-    AdmitParams, BoundTool, CallSource, InvalidArguments, PROGRAMMATIC,
-    ProgrammaticService, Result, SendParams, ToolView, TOOLS, TURN_PROJECTION,
-    Turn, TurnProjection,
-)
+from plugins.programmatic.contract import AdmitParams, PROGRAMMATIC, ProgrammaticService, SendParams
+from plugins.tools.contract import ProviderBoundTool as BoundTool, CallSource, Result, ToolView, TOOLS
+from plugins.turn_projection.contract import TURN_PROJECTION, Turn, TurnProjection
 
 from .checkout import CheckoutManager
 from .github_client import GitHubClient
@@ -35,6 +33,10 @@ from .operations import GitHubOperations
 
 logger = logging.getLogger("plugin.github-watch")
 _REPOSITORY = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+
+
+class InvalidArguments(ValueError):
+    """工具参数或调用来源不满足声明合同。"""
 
 
 class GitHubWatchConfig(BaseModel):
@@ -302,7 +304,7 @@ class Runtime:
         return await run_file_io(work)
 
 
-class GitHubTool(BoundTool):
+class GitHubTool:
     """Bind one operation to the immutable Message prefix that requested it."""
     idempotent = True
 
