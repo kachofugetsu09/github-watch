@@ -196,3 +196,21 @@ def test_agent_operation_comment_never_reawakens_owner_thread(tmp_path):
     watch._discover_repository("owner/repo")
 
     assert ledger.pending_events() == []
+
+
+def test_closed_and_merged_rows_never_wake_an_event(tmp_path):
+    fake = FakeGitHub()
+    fake.pull_rows = [item(9, "t1") | {"state": "open"}]
+    watch, ledger = build_watch(tmp_path, fake)
+    watch._discover_repository("owner/repo")
+
+    # 基线之后才出现、但已经合并的 PR 不产生事件。
+    fake.pull_rows.append(item(11, "t2") | {"state": "closed", "merged": True})
+    watch._discover_repository("owner/repo")
+    assert ledger.pending_events() == []
+
+    # 已观察过的 PR 关闭后，新的 owner mention 也不再唤醒。
+    fake.comment_rows[9] = [comment(1, "owner", "@akashic-review-bot please look")]
+    fake.pull_rows[0] = item(9, "t2") | {"state": "closed", "merged": True}
+    watch._discover_repository("owner/repo")
+    assert ledger.pending_events() == []

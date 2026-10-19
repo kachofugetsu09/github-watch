@@ -19,7 +19,7 @@ Core 拥有 Message append、Session 准入、Turn 投影、Tool execution 和 g
 
 ## 状态和恢复
 
-SQLite 的事件状态依次为 `discovered -> claimed -> context_ready -> message_submitting -> dispatched -> completed`。`message_submitting` 保存确定性 Session 与 Input Message ID；启动恢复把它退回 `discovered` 并以相同 ID 重试。Core 接受相同 Message 后返回同一 identity，因此提交结果丢失不会生成第二条输入。旧 `turn_submitting` 行无法证明 Message identity，启动时保留为需人工核对的状态。
+SQLite 的事件状态依次为 `discovered -> claimed -> context_ready -> message_submitting -> dispatched -> completed`。`claimed` 之后先按远端当前状态复查对象是否仍为 open，已合并、关闭或删除时直接进入终态 `skipped` 并记录原因，不做 checkout、不提交 Message；发布前再复查一次，非 open 时返回 `skipped` 而不是写入。`message_submitting` 保存确定性 Session 与 Input Message ID；启动恢复把它退回 `discovered` 并以相同 ID 重试。Core 接受相同 Message 后返回同一 identity，因此提交结果丢失不会生成第二条输入。旧 `turn_submitting` 行无法证明 Message identity，启动时保留为需人工核对的状态。
 
 每个 operation checkout 从远端精确 commit 创建。插件只会删除通过 operation ID 验证的目录；正常删除由已提交 Input 所属投影的终态触发，长期遗留由 TTL sweeper 回收。远端写操作不随内存或 checkout 回滚。comment、review 和 PR 先查 operation marker；push 把一个 operation 永久绑定到一个分支名。
 

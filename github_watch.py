@@ -150,6 +150,7 @@ class GitHubWatch:
         for kind, item in rows:
             number, updated_at = self._item_identity(item)
             draft = self._item_draft(kind, item)
+            is_open = self._item_is_open(item)
             current = self._ledger.get_item(repo, kind, number)
             if current is None:
                 comments = self._client.comments(repo, number)
@@ -157,7 +158,7 @@ class GitHubWatch:
                 inserted = self._ledger.insert_item(
                     repo, kind, number, updated_at, last_comment_id, draft=draft
                 )
-                if inserted and not draft:
+                if inserted and not draft and is_open:
                     self._ledger.create_event(
                         event_key=f"{repo}:{kind}:{number}:opened",
                         repo=repo,
@@ -166,6 +167,17 @@ class GitHubWatch:
                         trigger_kind="opened",
                         trigger_id=str(number),
                     )
+                continue
+            if not is_open:
+                # 关闭或已合并的对象只推进游标，不因 draft 变化或 mention 再唤醒。
+                self._ledger.observe_item(
+                    repo,
+                    kind,
+                    number,
+                    updated_at=updated_at,
+                    last_comment_id=current.last_comment_id,
+                    draft=draft,
+                )
                 continue
             if current.last_updated_at == updated_at:
                 continue
@@ -228,6 +240,21 @@ class GitHubWatch:
         await run_file_io(lambda: self._ledger.transition(
             event.event_key, expected=("discovered",), status="claimed"
         ))
+        # 派发前复查：排队期间被合并或关闭的对象不再花一次 checkout 和 review。
+        closure = await run_file_io(lambda: self._closure_reason(event))
+        if closure is not None:
+            await run_file_io(lambda: self._ledger.transition(
+                event.event_key,
+                expected=("claimed",),
+                status="skipped",
+                error=f"object {closure} before dispatch",
+            ))
+            logger.info(
+                "github-watch skipped non-open object event=%s reason=%s",
+                event.event_key,
+                closure,
+            )
+            return
         try:
             manifest = await run_file_io(lambda: self._context.build(event))
             item = await run_file_io(lambda: _read_item(manifest))
@@ -359,8 +386,12 @@ class GitHubWatch:
         )
         delivery = (
             "完成分析后必须调用 github_watch_submit_review 发布一条 COMMENT review。"
+            "若工具返回 skipped 与 merged/closed 原因，说明该对象已不再是 open："
+            "不要重试、不要改发到别处，说明本轮作废即可。"
             if event.kind == "pr"
             else "完成分析后必须调用 github_watch_post_comment 发布一条 comment。"
+            "若工具返回 skipped 与 merged/closed 原因，说明该对象已不再是 open："
+            "不要重试、不要改发到别处，说明本轮作废即可。"
         )
         pull_request_contract = (
             f"如果本轮为当前 Issue 创建修复 PR，PR 正文必须包含独立一行 `Fixes #{event.number}`，"
@@ -421,6 +452,29 @@ message_push 是 fire-and-forget；调用后继续完成 GitHub comment/review�
         if kind != "pr":
             return False
         return bool(item.get("draft", False))
+
+    @staticmethod
+    def _item_is_open(item: dict[str, Any]) -> bool:
+        """只有明确读到非 open 才判为不开放，字段缺失时保持原行为。"""
+
+        state = item.get("state")
+        return state is None or state == "open"
+
+    def _closure_reason(self, event: EventState) -> str | None:
+        """派发前复查对象是否仍然 open；读取失败时不拦截真实任务。"""
+
+        try:
+            if event.kind == "pr":
+                item = self._client.pull(event.repo, event.number)
+            else:
+                item = self._client.issue(event.repo, event.number)
+        except GitHubTransportUnavailable:
+            return None
+        except GitHubApiError as exc:
+            return "deleted" if exc.status == 404 else None
+        if self._item_is_open(item):
+            return None
+        return "merged" if item.get("merged") is True else "closed"
 
     @staticmethod
     def _comment_id(comment: dict[str, Any]) -> int:

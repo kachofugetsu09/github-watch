@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from .checkout import CheckoutManager
-from .github_client import GitHubClient
+from .github_client import GitHubApiError, GitHubClient, GitHubTransportUnavailable
 from .ledger import EventState
 
 
@@ -27,6 +27,9 @@ class GitHubOperations:
         }
 
     def post_comment(self, event: EventState, body: str) -> dict[str, Any]:
+        blocker = self._publish_blocker(event)
+        if blocker is not None:
+            return {"skipped": True, "reason": blocker}
         marker = self._marker(event)
         for comment in self._client.comments(event.repo, event.number):
             if marker in str(comment.get("body") or ""):
@@ -41,6 +44,9 @@ class GitHubOperations:
     def submit_review(self, event: EventState, body: str) -> dict[str, Any]:
         if event.kind != "pr":
             raise ValueError("formal review requires a PR event")
+        blocker = self._publish_blocker(event)
+        if blocker is not None:
+            return {"skipped": True, "reason": blocker}
         marker = self._marker(event)
         for review in self._client.reviews(event.repo, event.number):
             if marker in str(review.get("body") or ""):
@@ -83,6 +89,24 @@ class GitHubOperations:
             base=base,
         )
         return {"duplicate": False, "url": result.get("html_url")}
+
+    def _publish_blocker(self, event: EventState) -> str | None:
+        """已合并或已关闭的对象不再接收新的 review 或 comment。
+
+        读取状态失败时放行：丢掉真实结论比留下一条过期评论更糟。
+        """
+
+        try:
+            if event.kind == "pr":
+                item = self._client.pull(event.repo, event.number)
+            else:
+                item = self._client.issue(event.repo, event.number)
+        except (GitHubApiError, GitHubTransportUnavailable):
+            return None
+        state = item.get("state")
+        if state is None or state == "open":
+            return None
+        return "merged" if item.get("merged") is True else "closed"
 
     @staticmethod
     def _marker(event: EventState) -> str:

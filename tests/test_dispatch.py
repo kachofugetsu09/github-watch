@@ -13,7 +13,11 @@ from github_watch_test_package.ledger import EventLedger
 
 
 class FakeGitHub:
-    pass
+    def issue(self, _repo: str, number: int) -> dict[str, object]:
+        return {"number": number, "state": "open"}
+
+    def pull(self, _repo: str, number: int) -> dict[str, object]:
+        return {"number": number, "state": "open", "merged": False}
 
 
 class FakeMessages:
@@ -154,6 +158,7 @@ def test_prompt_preserves_review_pr_and_notification_rules(tmp_path: Path) -> No
     prompt = watch._build_prompt(event, tmp_path / "manifest.json", tmp_path / "checkout")
     assert "只有这条 mention 明确要求修改代码" in prompt
     assert "Fixes #1" in prompt
+    assert "skipped 与 merged/closed 原因" in prompt
     assert "每个 Issue 修复链只创建一个 PR" in prompt
     assert "target_channel='mobile'" in prompt
     assert "每个 operation 最多调用一次" in prompt
@@ -164,3 +169,93 @@ def test_prompt_forbids_notification_without_target(tmp_path: Path) -> None:
     ledger = EventLedger(tmp_path / "events.sqlite3")
     watch = _watch(ledger, tmp_path)
     assert watch._notification_prompt() == "主 channel 通知未配置，禁止调用 message_push。"
+
+
+class ClosedGitHub:
+    def pull(self, _repo: str, number: int) -> dict[str, object]:
+        return {"number": number, "state": "closed", "merged": True}
+
+
+def _pending_pr_event(ledger: EventLedger):
+    ledger.establish_baseline("owner/repo", [])
+    assert ledger.insert_item("owner/repo", "pr", 5, "t1", 0)
+    event = ledger.create_event(
+        event_key="owner/repo:pr:5:opened", repo="owner/repo",
+        kind="pr", number=5, trigger_kind="opened", trigger_id="5",
+    )
+    assert event is not None
+    return event
+
+
+def test_merged_object_is_skipped_before_checkout(tmp_path: Path) -> None:
+    ledger = EventLedger(tmp_path / "events.sqlite3")
+    event = _pending_pr_event(ledger)
+
+    class Checkouts:
+        def sweep(self) -> list[str]:
+            return []
+
+        def prepare(self, *_args: object) -> object:
+            raise AssertionError("merged object must not be checked out")
+
+        def cleanup(self, _operation_id: str) -> bool:
+            return True
+
+    watch = GitHubWatch(
+        client=ClosedGitHub(),  # type: ignore[arg-type]
+        ledger=ledger, checkouts=Checkouts(),  # type: ignore[arg-type]
+        data_dir=tmp_path, mention="@akashic-review-bot",
+        bot_login="akashic-review-bot[bot]",
+    )
+    messages = FakeMessages()
+    asyncio.run(watch._process_event(event, messages))
+
+    saved = ledger.get_event(event.event_key)
+    assert saved.status == "skipped"
+    assert messages.admitted == []
+    assert messages.submitted == []
+    assert ledger.pending_events() == []
+
+    import sqlite3
+
+    with sqlite3.connect(ledger.path) as connection:
+        (reason,) = connection.execute(
+            "SELECT error FROM events WHERE event_key = ?", (event.event_key,)
+        ).fetchone()
+    assert "merged" in reason
+
+
+def test_open_object_still_dispatches_after_revalidation(
+    tmp_path: Path, monkeypatch
+) -> None:
+    ledger = EventLedger(tmp_path / "events.sqlite3")
+    event = _pending_pr_event(ledger)
+
+    class Checkouts:
+        def sweep(self) -> list[str]:
+            return []
+
+        def prepare(self, _event: object, _item: object) -> object:
+            return SimpleNamespace(path=tmp_path / "checkout")
+
+        def cleanup(self, _operation_id: str) -> bool:
+            return True
+
+    watch = GitHubWatch(
+        client=FakeGitHub(),  # type: ignore[arg-type]
+        ledger=ledger, checkouts=Checkouts(),  # type: ignore[arg-type]
+        data_dir=tmp_path, mention="@akashic-review-bot",
+        bot_login="akashic-review-bot[bot]",
+    )
+    evidence = tmp_path / "evidence"
+    evidence.mkdir()
+    manifest = evidence / "manifest.json"
+    manifest.write_text("{}", encoding="utf-8")
+    (evidence / "item.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(watch._context, "build", lambda _event: manifest)
+
+    messages = FakeMessages()
+    asyncio.run(watch._process_event(event, messages))
+
+    assert len(messages.submitted) == 1
+    assert ledger.get_event(event.event_key).status == "dispatched"
