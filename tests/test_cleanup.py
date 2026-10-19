@@ -7,12 +7,12 @@ from types import SimpleNamespace
 
 import pytest
 
-from agent.plugin_composition.messages import MESSAGE_CATALOG
+from plugins.ledger.contract import MESSAGE_CATALOG
 from plugins.turn_projection.plugin import TurnProjection
-from session.log import MessageLog
-from session.message import Input, Output
+from plugins.ledger.log import MessageLog
+from plugins.ledger.contract import Input, Output
 
-from github_watch_test_package.contracts import TURN_PROJECTION
+from plugins.turn_projection.contract import TURN_PROJECTION
 from github_watch_test_package.ledger import EventLedger
 from github_watch_test_package.plugin import Runtime
 

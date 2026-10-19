@@ -20,9 +20,8 @@ from types import ModuleType, SimpleNamespace
 from typing import Any
 
 from agent.plugins.manager import PluginManager
-from infra.channels.artifacts import ChannelAttachmentArtifactStore
-from session.artifact_store import ArtifactStore
-from session.message import Input
+from plugins.ledger.contract import MESSAGE_CATALOG, Input
+from plugins.ledger.log import MessageLog
 from tests.test_default_reply import application
 
 
@@ -63,8 +62,9 @@ async def scenario(plugin: Any, kind: str, expect_blocking: bool,
         def add_sources(sources: Path) -> None:
             nonlocal source_root
             source_root = sources
-            shutil.copytree(core / "plugins/programmatic", sources / "programmatic",
-                            ignore=shutil.ignore_patterns("__pycache__"))
+            for name in ("programmatic", "gateway"):
+                shutil.copytree(core / "plugins" / name, sources / name,
+                                ignore=shutil.ignore_patterns("__pycache__"))
 
         # 1. 真实 Manager 提供 programmatic API；没有 reply loop、模型或 GitHub 请求。
         async with application(root, replying=False, extra_sources=add_sources) as (log, host):
@@ -279,13 +279,14 @@ async def scenario(plugin: Any, kind: str, expect_blocking: bool,
                     await termination
 
             state = ledger.get_event(event.event_key)
-            first = tuple(message for message in log.reader(session_id).snapshot()
-                          if isinstance(message.body, Input))
+            with closing(MessageLog(root / "workspace" / "sessions.db")) as observed:
+                first = tuple(message for message in observed.reader(session_id).snapshot()
+                              if isinstance(message.body, Input))
             expected_first = 0 if kind in {"intent_cancel", "terminate_intent", "write_error_cancel"} else 1
             assert len(first) == expected_first
             assert all(message.message_id == input_id for message in first)
             receipts.update(before_restart_status=state.status, before_restart_inputs=len(first))
-            accepted_rows = raw_messages(root / "sessions.db")
+            accepted_rows = raw_messages(root / "workspace" / "sessions.db")
             if kind in {"intent_cancel", "terminate_intent", "response_lost", "recovery_error_cancel"}:
                 assert state.status == "message_submitting"
             elif kind == "write_error_cancel":
@@ -297,11 +298,7 @@ async def scenario(plugin: Any, kind: str, expect_blocking: bool,
             await host.terminate_all()
             assert source_root is not None
 
-            metadata = ArtifactStore(root / "sessions.db")
-            artifacts = ChannelAttachmentArtifactStore(workspace=root / "workspace", metadata_store=metadata)
-            reopened = PluginManager([source_root], workspace=root / "workspace",
-                                     installed_cache_root=root / "home/cache", message_log=log,
-                                     channel_attachment_store=artifacts)
+            reopened = PluginManager([source_root], workspace=root / 'workspace', installed_cache_root=root / 'home/cache')
             try:
                 await reopened.load_all()
                 await reopened.start_runtime()
@@ -319,11 +316,11 @@ async def scenario(plugin: Any, kind: str, expect_blocking: bool,
                     await watch._dispatch_message(event, manifest, checkout, next_port)
                 else:
                     assert current.status == "dispatched" and recovery["safe_requeued"] == 0
-                final = tuple(message for message in log.reader(session_id).snapshot()
+                final = tuple(message for message in fresh.context.require(MESSAGE_CATALOG).reader(session_id).snapshot()
                               if isinstance(message.body, Input))
                 assert len(final) == 1 and final[0].message_id == input_id
                 assert final[0].body.parts[0].value == prompt
-                final_rows = raw_messages(root / "sessions.db")
+                final_rows = raw_messages(root / "workspace" / "sessions.db")
                 assert final_rows[:len(accepted_rows)] == accepted_rows
                 with closing(connect(path)) as connection:
                     assert connection.execute("PRAGMA integrity_check").fetchone() == ("ok",)
@@ -333,7 +330,6 @@ async def scenario(plugin: Any, kind: str, expect_blocking: bool,
                                 messages_sha256=digest(final_rows), ledger_events=1)
             finally:
                 await reopened.terminate_all()
-                metadata.close()
 
             return receipts
 

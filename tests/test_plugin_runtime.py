@@ -15,15 +15,13 @@ import pytest
 
 from agent.plugin_composition.config_input import save_config
 from agent.plugins.manager import PluginManager
-from infra.channels.artifacts import ChannelAttachmentArtifactStore
-from session.artifact_store import ArtifactStore
 from plugins.models.contract import ToolCall as ModelToolCall
 from plugins.tools.contract import TOOL_LOADING_PRESENTATION
 from plugins.tools.contract import TOOL_PROGRAM_V2 as TOOL_PROGRAM
 from plugins.content.plugin import check_text
 from plugins.programmatic.control import AdmitParams, PROGRAMMATIC, SendParams
 from plugins.tools.plugin import TOOLS, ALL_TOOLS
-from session.message import CallRef, ContentPart, Output, ToolCall
+from plugins.ledger.contract import MESSAGE_CATALOG, CallRef, ContentPart, Output, ToolCall
 from tests.test_default_reply import application
 
 from github_watch_test_package.ledger import EventLedger  # pyright: ignore[reportMissingImports]
@@ -183,67 +181,70 @@ async def test_real_manager_message_tool_db_uses_local_github_endpoint(
             async def allow(_binding: str, _arguments: object):
                 return {"allowed": True}
 
-            menu = await root.context.require(TOOL_PROGRAM).create_menu(
-                log.reader(session_id),
-                "programmatic",
-                content={"text": check_text},
-                check_start=lambda _transaction: None,
-                authorize=allow,
-                view=view,
-                presentation=presentation,
-            )
-            assert not any(
-                schema["function"]["name"].startswith("github_watch_")
-                for schema in menu.schemas
-            )
-            loaded = menu.decode(ModelToolCall(
-                "github-load", "load_tools", {"plugin": "github-watch"},
-            ))
-            assert loaded.binding_id is not None
-            call_writer = log.writer(
-                session_id, author="assistant", source="programmatic",
-                body_types=(Output,), content={}, check_call=menu.check_call,
-            )
-            call_writer.append("github-load", Output((ToolCall(
-                loaded.binding_id, {"plugin": "github-watch"},
-            ),), "continue"))
-            loaded_result = await menu.execute(CallRef("github-load", 0))
-            assert loaded_result.outcome == "success"
-            loaded_tools = json.loads(loaded_result.parts[0].value)["tools"]
-            assert len(loaded_tools) == 5
-            assert all(
-                schema["function"]["name"].startswith("github_watch_")
-                for schema in loaded_tools
-            )
-            decoded = menu.decode(
-                ModelToolCall(
-                    "github-call",
-                    "tool_call",
-                    {"name": "github_watch_post_comment", "arguments": {
-                        "operation_id": event.operation_id, "body": "local review result",
-                    }},
+            tools_owner = host.generation("tools")
+            assert tools_owner is not None and tools_owner.fiber is not None
+            async with tools_owner.fiber.context.runtime_scope():
+                menu = await root.context.require(TOOL_PROGRAM).create_menu(
+                    log.reader(session_id),
+                    "programmatic",
+                    content={"text": check_text},
+                    check_start=lambda _transaction: None,
+                    authorize=allow,
+                    view=view,
+                    presentation=presentation,
                 )
-            )
-            assert decoded.binding_id is not None
-            binding = decoded.binding_id
-            call_writer = log.writer(
-                session_id, author="assistant", source="programmatic",
-                body_types=(Output,), content={}, check_call=menu.check_call,
-            )
-            call_writer.append(
-                "github-call",
-                Output((ToolCall(binding, {
-                    "operation_id": event.operation_id, "body": "local review result",
-                }),), "continue"),
-            )
-            ref = CallRef("github-call", 0)
-            result = await menu.execute(ref)
-            repeated = await menu.execute(ref)
-            assert result.outcome == "success"
-            assert repeated == result
-            comments = [row for row in writes if row[1].endswith("/issues/1/comments")]
-            assert len(comments) == 1
-            assert "<!-- akashic-operation:" + event.operation_id + " -->" in cast(str, comments[0][2]["body"])
+                assert not any(
+                    schema["function"]["name"].startswith("github_watch_")
+                    for schema in menu.schemas
+                )
+                loaded = menu.decode(ModelToolCall(
+                    "github-load", "load_tools", {"plugin": "github-watch"},
+                ))
+                assert loaded.binding_id is not None
+                call_writer = log.writer(
+                    session_id, author="assistant", source="programmatic",
+                    body_types=(Output,), content={}, check_call=menu.check_call,
+                )
+                call_writer.append("github-load", Output((ToolCall(
+                    loaded.binding_id, {"plugin": "github-watch"},
+                ),), "continue"))
+                loaded_result = await menu.execute(CallRef("github-load", 0))
+                assert loaded_result.outcome == "success"
+                loaded_tools = json.loads(loaded_result.parts[0].value)["tools"]
+                assert len(loaded_tools) == 5
+                assert all(
+                    schema["function"]["name"].startswith("github_watch_")
+                    for schema in loaded_tools
+                )
+                decoded = menu.decode(
+                    ModelToolCall(
+                        "github-call",
+                        "tool_call",
+                        {"name": "github_watch_post_comment", "arguments": {
+                            "operation_id": event.operation_id, "body": "local review result",
+                        }},
+                    )
+                )
+                assert decoded.binding_id is not None
+                binding = decoded.binding_id
+                call_writer = log.writer(
+                    session_id, author="assistant", source="programmatic",
+                    body_types=(Output,), content={}, check_call=menu.check_call,
+                )
+                call_writer.append(
+                    "github-call",
+                    Output((ToolCall(binding, {
+                        "operation_id": event.operation_id, "body": "local review result",
+                    }),), "continue"),
+                )
+                ref = CallRef("github-call", 0)
+                result = await menu.execute(ref)
+                repeated = await menu.execute(ref)
+                assert result.outcome == "success"
+                assert repeated == result
+                comments = [row for row in writes if row[1].endswith("/issues/1/comments")]
+                assert len(comments) == 1
+                assert "<!-- akashic-operation:" + event.operation_id + " -->" in cast(str, comments[0][2]["body"])
 
             final = log.writer(
                 session_id, author="assistant", source="programmatic",
@@ -262,17 +263,7 @@ async def test_real_manager_message_tool_db_uses_local_github_endpoint(
             await host.terminate_all()
             assert source_root is not None
 
-            restart_metadata = ArtifactStore(tmp_path / "sessions.db")
-            restart_artifacts = ChannelAttachmentArtifactStore(
-                workspace=tmp_path / "workspace", metadata_store=restart_metadata,
-            )
-            restarted = PluginManager(
-                [source_root],
-                workspace=tmp_path / "workspace",
-                installed_cache_root=tmp_path / "home/cache",
-                message_log=log,
-                channel_attachment_store=restart_artifacts,
-            )
+            restarted = PluginManager([source_root], workspace=tmp_path / 'workspace', installed_cache_root=tmp_path / 'home/cache')
             try:
                 await restarted.load_all()
                 await restarted.start_runtime()
@@ -282,16 +273,20 @@ async def test_real_manager_message_tool_db_uses_local_github_endpoint(
                 restart_view, restart_presentation = restart_root.context.require(TOOL_LOADING_PRESENTATION)(
                     restart_catalog.view(*restart_root.context.require(ALL_TOOLS)().refs)
                 )
-                restart_menu = await restart_root.context.require(TOOL_PROGRAM).create_menu(
-                    log.reader(session_id),
-                    "programmatic",
-                    content={"text": check_text},
-                    check_start=lambda _transaction: None,
-                    authorize=allow,
-                    view=restart_view,
-                    presentation=restart_presentation,
-                )
-                replayed = await restart_menu.execute(ref)
+                restart_log = restart_root.context.require(MESSAGE_CATALOG)
+                restart_tools = restarted.generation("tools")
+                assert restart_tools is not None and restart_tools.fiber is not None
+                async with restart_tools.fiber.context.runtime_scope():
+                    restart_menu = await restart_root.context.require(TOOL_PROGRAM).create_menu(
+                        restart_log.reader(session_id),
+                        "programmatic",
+                        content={"text": check_text},
+                        check_start=lambda _transaction: None,
+                        authorize=allow,
+                        view=restart_view,
+                        presentation=restart_presentation,
+                    )
+                    replayed = await restart_menu.execute(ref)
                 assert replayed == result
                 assert ledger.get_event(event.event_key).status == "completed"
                 comments = [
@@ -301,4 +296,3 @@ async def test_real_manager_message_tool_db_uses_local_github_endpoint(
                 assert len(comments) == 1
             finally:
                 await restarted.terminate_all()
-                restart_metadata.close()
