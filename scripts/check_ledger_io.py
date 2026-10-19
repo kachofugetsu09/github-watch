@@ -96,6 +96,7 @@ async def scenario(plugin: Any, kind: str, expect_blocking: bool,
             if kind == "recovery_error_cancel":
                 # 此处只隔离回执恢复；远端 evidence/Git 不在本场景验收范围。
                 (root / "item.json").write_text("{}", encoding="utf-8")
+                watch._client = SimpleNamespace(issue=lambda _repo, _number: {"state": "open"})
                 watch._context.build = lambda _event: manifest
                 watch._checkouts = SimpleNamespace(prepare=lambda _event, _item: SimpleNamespace(path=checkout))
             prompt = watch._build_prompt(event, manifest, checkout)
