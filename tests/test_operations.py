@@ -46,6 +46,12 @@ class FakeClient:
     def pulls(self, _repo: str) -> list[dict[str, Any]]:
         return self.pull_rows
 
+    def pull(self, _repo: str, number: int) -> dict[str, Any]:
+        return {"number": number, "state": "open", "merged": False}
+
+    def issue(self, _repo: str, number: int) -> dict[str, Any]:
+        return {"number": number, "state": "open"}
+
     def repository(self, _repo: str) -> dict[str, Any]:
         return {"default_branch": "main"}
 
@@ -108,3 +114,49 @@ def test_push_and_create_pull_are_bound_to_operation_branch() -> None:
     ) == {"duplicate": False, "url": "pull-url"}
     assert client.writes[-1][0] == "pull"
     assert f"akashic-operation:{owner_mention.operation_id}" in client.writes[-1][1]
+
+
+class ClosedClient(FakeClient):
+    def __init__(self, state: str, merged: bool) -> None:
+        super().__init__()
+        self.state = state
+        self.merged = merged
+
+    def pull(self, _repo: str, number: int) -> dict[str, Any]:
+        return {"number": number, "state": self.state, "merged": self.merged}
+
+    def issue(self, _repo: str, number: int) -> dict[str, Any]:
+        return {"number": number, "state": self.state}
+
+
+def test_merged_pull_skips_review_without_writing() -> None:
+    client = ClosedClient("closed", True)
+    operations = GitHubOperations(client, FakeCheckouts())  # type: ignore[arg-type]
+
+    result = operations.submit_review(event(kind="pr"), "review body")
+
+    assert result == {"skipped": True, "reason": "merged"}
+    assert client.writes == []
+
+
+def test_closed_issue_skips_comment_without_writing() -> None:
+    client = ClosedClient("closed", False)
+    operations = GitHubOperations(client, FakeCheckouts())  # type: ignore[arg-type]
+
+    result = operations.post_comment(event(kind="issue"), "comment body")
+
+    assert result == {"skipped": True, "reason": "closed"}
+    assert client.writes == []
+
+
+def test_open_object_keeps_writing_and_deduplicating() -> None:
+    client = FakeClient()
+    operations = GitHubOperations(client, FakeCheckouts())  # type: ignore[arg-type]
+
+    first = operations.submit_review(event(kind="pr"), "review body")
+    assert first["duplicate"] is False
+    assert [kind for kind, _ in client.writes] == ["review"]
+
+    client.review_rows = [{"body": client.writes[0][1], "html_url": "review-url"}]
+    second = operations.submit_review(event(kind="pr"), "review body")
+    assert second == {"duplicate": True, "url": "review-url"}
