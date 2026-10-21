@@ -55,16 +55,34 @@ function Detail({ query, repo, item }) {
     h("p", { className: "gw-note" }, "同一 Issue/PR 复用一个会话，后面的轮次带着完整历史，输入是累积值。"));
 }
 
-function Repos({ data, selected, pick }) {
+function Item({ repo, item, selected, pick }) {
+  return h("button", { type: "button", className: "gw-item",
+    "aria-current": selected && selected.repo === repo && selected.number === item.number || undefined,
+    onClick: () => pick({ repo, number: item.number, item }) },
+    h("span", { className: "t" }, `#${item.number} ${kind(item.kind)}`), h("span", { className: "n" }, fmt(item.input_tokens)),
+    h("span", { className: "s" }, `${item.turns} 轮 · ${when(item.last_recorded_at)}`), h("span", { className: "n" }, pct(item.hit_rate)));
+}
+
+// 首屏每个仓库只列前几个对象；点「列出全部」再按仓库读完整列表，回包不随仓库数膨胀。
+function RepoObjects({ query, repo, selected, pick }) {
+  const [full, setFull] = useState(null);
+  const [error, setError] = useState("");
+  const objects = full ? full.objects : repo.objects;
+  const more = full ? full.more : repo.more;
+  const load = () => query("usage.objects", { repo: repo.repo }).then(setFull,
+    (reason) => setError(reason instanceof Error ? reason.message : String(reason)));
+  return h(Fragment, null,
+    objects.map((item) => h(Item, { key: item.number, repo: repo.repo, item, selected, pick })),
+    !more ? null : full ? h("p", { className: "gw-note" }, `另有 ${more} 个对象未列出`)
+      : h("button", { type: "button", className: "gw-more", onClick: load }, error || `列出全部（另有 ${more} 个）`));
+}
+
+function Repos({ query, data, selected, pick }) {
   return h("div", { className: "gw-list" }, data.repos.map((repo) => h(Fragment, { key: repo.repo },
     h("div", { className: "gw-repo" }, h("span", { className: "t" }, repo.repo),
       h("span", { className: "n" }, fmt(repo.totals.input_tokens)), h("span", { className: "n" }, pct(repo.totals.hit_rate))),
-    repo.objects.map((item) => h("button", { key: item.number, type: "button", className: "gw-item",
-      "aria-current": selected && selected.repo === repo.repo && selected.number === item.number || undefined,
-      onClick: () => pick({ repo: repo.repo, number: item.number }) },
-      h("span", { className: "t" }, `#${item.number} ${kind(item.kind)}`), h("span", { className: "n" }, fmt(item.input_tokens)),
-      h("span", { className: "s" }, `${item.turns} 轮 · ${when(item.last_recorded_at)}`), h("span", { className: "n" }, pct(item.hit_rate)))),
-    repo.more ? h("p", { className: "gw-note" }, `另有 ${repo.more} 个对象未列出`) : null)));
+    h(RepoObjects, { query, repo, selected, pick }))),
+    data.more ? h("p", { className: "gw-note" }, `另有 ${data.more} 个仓库未列出`) : null);
 }
 
 function Panel({ context }) {
@@ -82,11 +100,11 @@ function Panel({ context }) {
     h(Metric, { value: pct(totals.hit_rate), label: "缓存命中" }),
     h(Metric, { value: String(totals.objects), label: `个对象 · ${totals.turns} 轮` }));
   const pick = (next) => { setSelected(next); setPushed(true); if (size === "compact") panel.setSize("expanded"); };
-  if (size === "compact") return h("div", { className: "gw-panel" }, kpis, h(Repos, { data, selected: null, pick }));
+  if (size === "compact") return h("div", { className: "gw-panel" }, kpis, h(Repos, { query: context.query, data, selected: null, pick }));
   const active = selected || { repo: data.repos[0].repo, number: data.repos[0].objects[0].number };
-  const item = data.repos.find((repo) => repo.repo === active.repo)?.objects.find((entry) => entry.number === active.number);
+  const item = active.item || data.repos.find((repo) => repo.repo === active.repo)?.objects.find((entry) => entry.number === active.number);
   const detail = item ? h(Detail, { key: `${active.repo}#${active.number}`, query: context.query, repo: active.repo, item }) : null;
-  const list = h("div", { className: "gw-pane" }, kpis, h(Repos, { data, selected: active, pick }));
+  const list = h("div", { className: "gw-pane" }, kpis, h(Repos, { query: context.query, data, selected: active, pick }));
   if (panel.sheet) return h("div", { className: "gw-panel" }, pushed && detail
     ? h(Fragment, null, h("button", { type: "button", className: "gw-back", onClick: () => setPushed(false) }, "← 返回列表"), detail) : list);
   return h("div", { className: "gw-panel gw-split" }, list, h("div", { className: "gw-pane" }, detail));

@@ -308,6 +308,25 @@ class EventLedger:
                 """).fetchall()
         return [EventState(*row) for row in rows]
 
+    # 首次提交前冻结这次事件的模型选择，重试一律复用，同一 Message ID 的正文才不会变。
+    # 已有 input_message_id 却没有冻结值的，是旧版本提交过的事件：返回 None，按旧正文不带模型字段重试。
+    def freeze_model(self, event_key: str, proposed: str) -> str | None:
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT input_message_id, model_pin FROM events WHERE event_key = ?", (event_key,)
+            ).fetchone()
+            if row is None:
+                raise RuntimeError(f"event missing: {event_key}")
+            input_message_id, pinned = row
+            if pinned is not None or input_message_id is not None:
+                return pinned
+            connection.execute(
+                "UPDATE events SET model_pin = ?, updated_at = ? WHERE event_key = ?",
+                (proposed, utc_now(), event_key),
+            )
+        return proposed
+
     def transition(
         self,
         event_key: str,
@@ -382,6 +401,7 @@ class EventLedger:
                     thread_id TEXT,
                     turn_id TEXT,
                     input_message_id TEXT,
+                    model_pin TEXT,
                     response TEXT,
                     artifact_id TEXT,
                     error TEXT,
@@ -404,6 +424,8 @@ class EventLedger:
         }
         if "input_message_id" not in event_columns:
             connection.execute("ALTER TABLE events ADD COLUMN input_message_id TEXT")
+        if "model_pin" not in event_columns:
+            connection.execute("ALTER TABLE events ADD COLUMN model_pin TEXT")
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:

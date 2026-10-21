@@ -28,7 +28,10 @@ class FakeMessages:
     async def admit(self, session_id: str) -> None:
         self.admitted.append(session_id)
 
-    async def submit(self, session_id: str, message_id: str, content: str) -> str:
+    async def model(self) -> str:
+        return '{"model_id": null, "reasoning_effort": null}'
+
+    async def submit(self, session_id: str, message_id: str, content: str, model: str | None) -> str:
         self.submitted.append((session_id, message_id, content))
         return message_id
 
@@ -127,7 +130,7 @@ def test_submission_failure_requeues_same_idempotent_message(tmp_path: Path, mon
     )
 
     class Failing(FakeMessages):
-        async def submit(self, session_id: str, message_id: str, content: str) -> str:
+        async def submit(self, session_id: str, message_id: str, content: str, model: str | None) -> str:
             self.submitted.append((session_id, message_id, content))
             raise RuntimeError("connection closed after append")
 

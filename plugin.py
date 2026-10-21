@@ -31,7 +31,7 @@ from plugins.plugin_settings.contract import SETTINGS_FORMS, SettingsField, Sett
 from plugins.turn_projection.contract import TURN_PROJECTION, Turn, TurnProjection
 from plugins.ui.contract import UI_SLOTS, PluginUiDefinition, PluginUiRpcInvalidRequest
 
-from .usage import TurnUsage, UsageLedger, measure_turn, panel_repos, panel_turns, summarize
+from .usage import TurnUsage, UsageLedger, measure_turn, panel_objects, panel_repos, panel_turns, summarize
 
 from .checkout import CheckoutManager
 from .github_client import GitHubClient
@@ -47,6 +47,9 @@ class InvalidArguments(ValueError):
     """工具参数或调用来源不满足声明合同。"""
 
 
+# 每个 Issue/PR 会话由这里发起回合，模型按插件设置解析；会话里另选的模型会被下一次触发覆盖。
+REVIEW_MODEL = ModelUse("github_watch", "GitHub 代码评审")
+
 class GitHubWatchConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     app_id: int = Field(gt=0)
@@ -61,6 +64,12 @@ class GitHubWatchConfig(BaseModel):
     notify_chat_id: str | None = None
     # 评审用的模型；没指定就跟随全局默认模型，指定的不可用时也回到默认。
     model: ModelChoice = ModelChoice(follow="default")
+
+    # 配置可能不经设置表单写入，在配置边界就拒绝这个用途不支持的跟随方式。
+    @field_validator("model")
+    @classmethod
+    def validate_model(cls, value: ModelChoice) -> ModelChoice:
+        return REVIEW_MODEL.check(value)
 
     @field_validator("repositories")
     @classmethod
@@ -115,9 +124,6 @@ _MODELS: dict[str, type[BaseModel]] = {
 }
 
 
-# 每个 Issue/PR 会话由这里发起回合，模型按插件设置解析；会话里另选的模型会被下一次触发覆盖。
-REVIEW_MODEL = ModelUse("github_watch", "GitHub 代码评审")
-
 SETTINGS_FORM = SettingsForm(
     title="GitHub Watch", description="轮询关注的仓库，被 @ 提及或请求评审时在对应 PR 的会话里工作。",
     fields=(
@@ -142,14 +148,18 @@ class _ProgrammaticMessages(ProgrammaticMessagePort):
         if result.get("session_id") != session_id:
             raise RuntimeError("programmatic Session admission identity mismatch")
 
-    async def submit(self, session_id: str, message_id: str, content: str) -> str:
-        # 两个模型字段总是显式给出：选回默认时空值也要写进会话，清掉上一次的指定。
+    async def model(self) -> str:
         model = await self._model()
-        result = await self._api.call(
-            "programmatic/message/send",
-            SendParams(session_id=session_id, message_id=message_id, text=content,
-                       model_id=model.model_id, reasoning_effort=model.reasoning_effort),
-        )
+        return json.dumps({"model_id": model.model_id, "reasoning_effort": model.reasoning_effort})
+
+    async def submit(self, session_id: str, message_id: str, content: str, model: str | None) -> str:
+        # 冻结的选择里两个字段总是显式给出：选回默认时空值也要写进会话，清掉上一次的指定。
+        params = SendParams(session_id=session_id, message_id=message_id, text=content)
+        if model is not None:
+            pinned = json.loads(model)
+            params = SendParams(session_id=session_id, message_id=message_id, text=content,
+                                model_id=pinned["model_id"], reasoning_effort=pinned["reasoning_effort"])
+        result = await self._api.call("programmatic/message/send", params)
         accepted = result.get("message_id")
         if accepted != message_id:
             raise RuntimeError("programmatic Message admission identity mismatch")
@@ -369,14 +379,19 @@ class Runtime:
             ),
         }
 
-    # Sidebar usage panel: usage.repos for the list, usage.turns {repo, number} for one Issue/PR.
+    # Sidebar usage panel: usage.repos for the list, usage.objects {repo} for one repo's full list,
+    # usage.turns {repo, number} for one Issue/PR.
     async def panel_query(self, method: str, payload: dict[str, object], *,
                           session_id: str | None, turn_id: str | None) -> dict[str, object]:
         _ = session_id, turn_id
         if method == "usage.repos" and not payload:
             return panel_repos(await self._usage_records())
         repo, number = payload.get("repo"), payload.get("number")
-        if method == "usage.turns" and set(payload) == {"repo", "number"} and isinstance(repo, str) and type(number) is int:
+        if not isinstance(repo, str) or _REPOSITORY.fullmatch(repo) is None:
+            raise PluginUiRpcInvalidRequest(f"github-watch 面板查询需要 owner/repo: {method}")
+        if method == "usage.objects" and set(payload) == {"repo"}:
+            return panel_objects(await self._usage_records(), repo)
+        if method == "usage.turns" and set(payload) == {"repo", "number"} and type(number) is int and number > 0:
             return panel_turns(await self._usage_records(), repo, number)
         raise PluginUiRpcInvalidRequest(f"github-watch 面板不支持的查询: {method}")
 

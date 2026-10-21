@@ -28,3 +28,6 @@ button.gw-item:hover, .gw-item[aria-current] { background: var(--chat-chip); }
 .gw-bars i.soft { background: color-mix(in oklab, var(--chat-ink) 22%, transparent); }
 .gw-back { justify-self: start; min-height: 44px; border: 0; background: none; color: inherit; font: inherit; cursor: pointer; }
 @media (max-width: 720px) { .gw-split { grid-template-columns: 1fr; } }
+.gw-more { all: unset; cursor: pointer; padding: 6px 8px; font-size: 12px; color: var(--chat-faint); }
+.gw-more:hover { color: var(--chat-ink); }
+.gw-more:focus-visible { outline: 2px solid var(--chat-focus, currentColor); outline-offset: 2px; border-radius: 6px; }

@@ -58,7 +58,11 @@ class ProgrammaticMessagePort(Protocol):
 
     async def admit(self, session_id: str) -> None: ...
 
-    async def submit(self, session_id: str, message_id: str, content: str) -> str: ...
+    # 这次评审要用的模型，序列化后冻结进账本；同一事件的重试复用冻结值。
+    async def model(self) -> str: ...
+
+    # model 为 None 时不带模型字段（旧版本已提交过的事件按原正文重试）。
+    async def submit(self, session_id: str, message_id: str, content: str, model: str | None) -> str: ...
 
 
 class GitHubWatch:
@@ -353,6 +357,8 @@ class GitHubWatch:
 
         # 3. 先保存本地意图；相同 Message identity 的重试由 Core 验证正文相同。
         input_message_id = _input_message_id(event)
+        proposed = await messages.model()
+        model = await run_file_io(lambda: self._ledger.freeze_model(event.event_key, proposed))
         await run_file_io(lambda: self._ledger.transition(
             event.event_key,
             expected=("context_ready",),
@@ -360,7 +366,7 @@ class GitHubWatch:
             thread_id=session_id,
             input_message_id=input_message_id,
         ))
-        accepted = await messages.submit(session_id, input_message_id, prompt)
+        accepted = await messages.submit(session_id, input_message_id, prompt, model)
         if accepted != input_message_id:
             raise RuntimeError("programmatic Message receipt identity mismatch")
         await run_file_io(lambda: self._ledger.transition(
