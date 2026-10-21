@@ -293,3 +293,45 @@ def summarize(records: Iterable[TurnUsage]) -> dict[str, Any]:
         for field in ("input_tokens", "cached_input_tokens", "output_tokens")
     }
     return {"totals": totals, "objects": objects}
+
+
+# Panel replies are capped at 192 KiB by the host; keep rows small and bounded.
+_PANEL_REPOS = 30
+_PANEL_OBJECTS = 50
+_PANEL_TURNS = 100
+_PANEL_FIELDS = ("kind", "number", "turns", "calls", "input_tokens", "cached_input_tokens", "output_tokens",
+                 "hit_rate", "last_recorded_at")
+
+
+def panel_repos(records: Iterable[TurnUsage]) -> dict[str, Any]:
+    """Repo -> Issue/PR rows for the sidebar panel, each repo with its own totals."""
+
+    by_repo: dict[str, list[TurnUsage]] = {}
+    for usage in records:
+        by_repo.setdefault(usage.repo, []).append(usage)
+    repos = []
+    for repo, owned in by_repo.items():
+        report = summarize(owned)
+        objects = report["objects"]
+        repos.append({
+            "repo": repo, "totals": report["totals"], "more": max(0, len(objects) - _PANEL_OBJECTS),
+            "objects": [{name: item[name] for name in _PANEL_FIELDS} for item in objects[:_PANEL_OBJECTS]],
+        })
+    repos.sort(key=lambda item: -item["totals"]["input_tokens"])
+    return {"totals": summarize(record for owned in by_repo.values() for record in owned)["totals"],
+            "repos": repos[:_PANEL_REPOS], "more": max(0, len(repos) - _PANEL_REPOS)}
+
+
+def panel_turns(records: Iterable[TurnUsage], repo: str, number: int) -> dict[str, Any]:
+    """One Issue/PR's turns in time order, the latest _PANEL_TURNS of them."""
+
+    owned = sorted((usage for usage in records if usage.repo == repo and usage.number == number),
+                   key=lambda usage: usage.recorded_at)
+    return {
+        "session_id": owned[-1].session_id if owned else None,
+        "turns": [{
+            "trigger_kind": usage.trigger_kind, "recorded_at": usage.recorded_at, "models": list(usage.models),
+            "calls": usage.calls, "input_tokens": usage.input_tokens, "cached_input_tokens": usage.cached_input_tokens,
+            "output_tokens": usage.output_tokens, "excluded_calls": usage.excluded_calls,
+        } for usage in owned[-_PANEL_TURNS:]],
+    }

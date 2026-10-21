@@ -6,7 +6,7 @@ import asyncio
 import json
 import logging
 import re
-from collections.abc import AsyncGenerator, Callable, Iterable, Mapping
+from collections.abc import AsyncGenerator, Awaitable, Callable, Iterable, Mapping
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -15,6 +15,7 @@ from typing import Literal, cast
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 from agent.plugin_composition import Context, RUNTIME_STARTED, RUNTIME_STOPPING, ServiceKey
+from agent.plugin_composition.plugin_config import PLUGIN_CONFIG
 from plugins.timer.contract import TimerStatus
 from plugins.ledger.contract import MESSAGE_CATALOG, MessageCatalog
 from plugins.timer.contract import TIMERS
@@ -23,10 +24,14 @@ from core.common.file_io import run_file_io
 
 from plugins.programmatic.contract import AdmitParams, PROGRAMMATIC, ProgrammaticService, SendParams
 from plugins.tools.contract import ProviderBoundTool as BoundTool, CallSource, Result, ToolView, TOOLS
-from plugins.models.contract import MODEL_CALL_STATS, ModelCallStats
+from plugins.models.contract import (
+    CHAT_MODELS, MODEL_CALL_STATS, MODEL_CATALOG, ChatModelSelection, ModelCallStats, ModelChoice, ModelUse,
+)
+from plugins.plugin_settings.contract import SETTINGS_FORMS, SettingsField, SettingsForm, declare_settings
 from plugins.turn_projection.contract import TURN_PROJECTION, Turn, TurnProjection
+from plugins.ui.contract import UI_SLOTS, PluginUiDefinition, PluginUiRpcInvalidRequest
 
-from .usage import UsageLedger, measure_turn, summarize
+from .usage import TurnUsage, UsageLedger, measure_turn, panel_repos, panel_turns, summarize
 
 from .checkout import CheckoutManager
 from .github_client import GitHubClient
@@ -54,6 +59,8 @@ class GitHubWatchConfig(BaseModel):
     checkout_ttl_seconds: int = Field(default=86_400, ge=300)
     notify_channel: str | None = None
     notify_chat_id: str | None = None
+    # 评审用的模型；没指定就跟随全局默认模型，指定的不可用时也回到默认。
+    model: ModelChoice = ModelChoice(follow="default")
 
     @field_validator("repositories")
     @classmethod
@@ -108,10 +115,26 @@ _MODELS: dict[str, type[BaseModel]] = {
 }
 
 
+# 每个 Issue/PR 会话由这里发起回合，模型按插件设置解析；会话里另选的模型会被下一次触发覆盖。
+REVIEW_MODEL = ModelUse("github_watch", "GitHub 代码评审")
+
+SETTINGS_FORM = SettingsForm(
+    title="GitHub Watch", description="轮询关注的仓库，被 @ 提及或请求评审时在对应 PR 的会话里工作。",
+    family="github", family_label="GitHub",
+    fields=(
+        SettingsField("model", "评审用的模型", kind="model", use=REVIEW_MODEL,
+                      hint="回复提及、审 PR 时用；没指定就跟随默认模型"),
+        SettingsField("repositories", "关注的仓库", kind="lines", hint="owner/repo，每行一个"),
+        SettingsField("poll_seconds", "轮询间隔（秒）", kind="number", hint="最少 15"),
+    ),
+)
+
+
 class _ProgrammaticMessages(ProgrammaticMessagePort):
     """Adapt the ordinary programmatic source without inventing a Turn identity."""
-    def __init__(self, api: ProgrammaticService) -> None:
+    def __init__(self, api: ProgrammaticService, model: Callable[[], Awaitable[ChatModelSelection]]) -> None:
         self._api = api
+        self._model = model
 
     async def admit(self, session_id: str) -> None:
         result = await self._api.call(
@@ -121,9 +144,12 @@ class _ProgrammaticMessages(ProgrammaticMessagePort):
             raise RuntimeError("programmatic Session admission identity mismatch")
 
     async def submit(self, session_id: str, message_id: str, content: str) -> str:
+        # 两个模型字段总是显式给出：选回默认时空值也要写进会话，清掉上一次的指定。
+        model = await self._model()
         result = await self._api.call(
             "programmatic/message/send",
-            SendParams(session_id=session_id, message_id=message_id, text=content),
+            SendParams(session_id=session_id, message_id=message_id, text=content,
+                       model_id=model.model_id, reasoning_effort=model.reasoning_effort),
         )
         accepted = result.get("message_id")
         if accepted != message_id:
@@ -195,7 +221,7 @@ class Runtime:
                     _, _, _, watch = await self.bind()
                     await watch.poll(
                         self._config.repositories,
-                        _ProgrammaticMessages(self._ctx.require(PROGRAMMATIC)),
+                        _ProgrammaticMessages(self._ctx.require(PROGRAMMATIC), self.review_model),
                     )
             except asyncio.CancelledError:
                 raise
@@ -207,6 +233,13 @@ class Runtime:
                     self._ctx.require(MESSAGE_CATALOG), self._ctx.require(TURN_PROJECTION),
                 )
             await self._wait(datetime.now(UTC) + timedelta(seconds=self._config.poll_seconds))
+
+    # Models 不在时不带模型，回合用会话已有的选择或默认模型。
+    async def review_model(self) -> ChatModelSelection:
+        with self._ctx.borrow(CHAT_MODELS) as models:
+            if models is None:
+                return ChatModelSelection()
+            return await models.resolve(REVIEW_MODEL, self._config.model)
 
     async def _wait(self, deadline: datetime) -> None:
         handle = self._ctx.require(TIMERS).schedule(deadline)
@@ -319,14 +352,8 @@ class Runtime:
     ) -> object:
         """Summarize settled inference usage; filters apply before aggregation."""
 
-        ledger = self._usage
-        if ledger is None:
-            await self.bind()
-            ledger = self._usage
-        if ledger is None:
-            raise RuntimeError("usage ledger unavailable")
         records = [
-            record for record in await run_file_io(ledger.records)
+            record for record in await self._usage_records()
             if (repo is None or record.repo == repo)
             and (number is None or record.number == number)
         ]
@@ -342,6 +369,26 @@ class Runtime:
                 "因此总量是累积值而非单次成本。"
             ),
         }
+
+    # Sidebar usage panel: usage.repos for the list, usage.turns {repo, number} for one Issue/PR.
+    async def panel_query(self, method: str, payload: dict[str, object], *,
+                          session_id: str | None, turn_id: str | None) -> dict[str, object]:
+        _ = session_id, turn_id
+        if method == "usage.repos" and not payload:
+            return panel_repos(await self._usage_records())
+        repo, number = payload.get("repo"), payload.get("number")
+        if method == "usage.turns" and set(payload) == {"repo", "number"} and isinstance(repo, str) and type(number) is int:
+            return panel_turns(await self._usage_records(), repo, number)
+        raise PluginUiRpcInvalidRequest(f"github-watch 面板不支持的查询: {method}")
+
+    async def _usage_records(self) -> list[TurnUsage]:
+        ledger = self._usage
+        if ledger is None:
+            await self.bind()
+            ledger = self._usage
+        if ledger is None:
+            raise RuntimeError("usage ledger unavailable")
+        return await run_file_io(ledger.records)
 
     async def authorize(self, operation_id: str, session_id: str, *, code: bool = False) -> EventState:
         """从耐久账本读取归属，再在普通 Tool 边界核对本次来源。"""
@@ -480,7 +527,7 @@ def _definitions() -> tuple[tuple[str, str, Mapping[str, object], str], ...]:
 
 api_version = 3
 name = "github-watch"
-version = "4.1.0"
+version = "4.2.0"
 desc = "轮询 GitHub，以 programmatic Message 启动工作并提供受约束的 GitHub 工具。"
 inject = (TIMERS, PROGRAMMATIC, MESSAGE_CATALOG, TURN_PROJECTION, TOOLS)
 
@@ -506,6 +553,19 @@ async def apply(ctx: Context) -> None:
         ))
 
     await ctx.provide(GITHUB_WATCH_TOOLS, catalog.view(*refs))
+    # 设置页是可选依赖：plugin_settings 启用时才出现在「插件配置」里。
+    async def settings(child: Context) -> None:
+        _ = await declare_settings(child, GitHubWatchConfig, SETTINGS_FORM)
+
+    _ = await ctx.inject((SETTINGS_FORMS, PLUGIN_CONFIG, MODEL_CATALOG), settings, name="settings")
+
+    # 侧栏「插件面板」里的用量：仓库 -> Issue/PR -> 逐轮；聊天界面不在时不注册。
+    async def usage_panel(child: Context) -> None:
+        _ = await child.require(UI_SLOTS).register_plugin_ui(
+            child, PluginUiDefinition(module="plugin_ui.js", stylesheet="plugin_ui.css", slots=("sidebar.panels",)),
+            query=runtime.panel_query)
+
+    _ = await ctx.inject((UI_SLOTS,), usage_panel, name="usage-panel")
 
     watcher: asyncio.Task[None] | None = None
 
