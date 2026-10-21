@@ -314,10 +314,11 @@ class GitHubWatch:
             await self._dispatch_message(event, manifest, checkout.path, messages)
         except BaseException as error:
             try:
+                # 解析模型等提交前的失败停在 context_ready，同样还没碰提交边界，退回下一轮重试。
                 current = await run_file_io(lambda: self._ledger.get_event(event.event_key))
-                if current.status == "message_submitting":
+                if current.status in ("context_ready", "message_submitting"):
                     await run_file_io(lambda: self._ledger.transition(
-                        event.event_key, expected=("message_submitting",),
+                        event.event_key, expected=(current.status,),
                         status="discovered", error=repr(error),
                     ))
             except BaseException as recovery_error:
@@ -357,8 +358,10 @@ class GitHubWatch:
 
         # 3. 先保存本地意图；相同 Message identity 的重试由 Core 验证正文相同。
         input_message_id = _input_message_id(event)
-        proposed = await messages.model()
-        model = await run_file_io(lambda: self._ledger.freeze_model(event.event_key, proposed))
+        frozen, model = await run_file_io(lambda: self._ledger.frozen_model(event.event_key))
+        if not frozen:
+            proposed = await messages.model()
+            model = await run_file_io(lambda: self._ledger.freeze_model(event.event_key, proposed))
         await run_file_io(lambda: self._ledger.transition(
             event.event_key,
             expected=("context_ready",),

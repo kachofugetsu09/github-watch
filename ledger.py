@@ -308,6 +308,16 @@ class EventLedger:
                 """).fetchall()
         return [EventState(*row) for row in rows]
 
+    # 已冻结（或旧版本已提交）时返回 (True, 冻结值)，重试直接用它，不再解析当前模型。
+    def frozen_model(self, event_key: str) -> tuple[bool, str | None]:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT input_message_id, model_pin FROM events WHERE event_key = ?", (event_key,)
+            ).fetchone()
+        if row is None:
+            raise RuntimeError(f"event missing: {event_key}")
+        return (row[0] is not None or row[1] is not None), row[1]
+
     # 首次提交前冻结这次事件的模型选择，重试一律复用，同一 Message ID 的正文才不会变。
     # 已有 input_message_id 却没有冻结值的，是旧版本提交过的事件：返回 None，按旧正文不带模型字段重试。
     def freeze_model(self, event_key: str, proposed: str) -> str | None:
