@@ -6,7 +6,7 @@ import asyncio
 import json
 import logging
 import re
-from collections.abc import AsyncGenerator, Mapping
+from collections.abc import AsyncGenerator, Callable, Iterable, Mapping
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -18,12 +18,15 @@ from agent.plugin_composition import Context, RUNTIME_STARTED, RUNTIME_STOPPING,
 from plugins.timer.contract import TimerStatus
 from plugins.ledger.contract import MESSAGE_CATALOG, MessageCatalog
 from plugins.timer.contract import TIMERS
-from plugins.ledger.contract import ContentPart, Input, json_value
+from plugins.ledger.contract import ContentPart, Input, Message, json_value
 from core.common.file_io import run_file_io
 
 from plugins.programmatic.contract import AdmitParams, PROGRAMMATIC, ProgrammaticService, SendParams
 from plugins.tools.contract import ProviderBoundTool as BoundTool, CallSource, Result, ToolView, TOOLS
+from plugins.models.contract import MODEL_CALL_STATS, ModelCallStats
 from plugins.turn_projection.contract import TURN_PROJECTION, Turn, TurnProjection
+
+from .usage import UsageLedger, measure_turn, summarize
 
 from .checkout import CheckoutManager
 from .github_client import GitHubClient
@@ -137,6 +140,7 @@ class Runtime:
         self._bind_lock = asyncio.Lock()
         self._cleanup_lock = asyncio.Lock()
         self._cleanup_heads: dict[str, int] = {}
+        self._usage: UsageLedger | None = None
 
     async def bind(self) -> tuple[EventLedger, CheckoutManager, GitHubOperations, GitHubWatch]:
         """在正式 loop 取得路径，实际状态打开和恢复结束后才发布本代资源。"""
@@ -168,6 +172,7 @@ class Runtime:
             ttl_seconds=self._config.checkout_ttl_seconds,
         )
         operations = GitHubOperations(client, checkouts)
+        self._usage = UsageLedger(data_dir / "usage.jsonl")
         watch = GitHubWatch(
             client=client, ledger=ledger, checkouts=checkouts, data_dir=data_dir,
             mention=self._config.mention, bot_login=self._config.bot_login,
@@ -229,14 +234,17 @@ class Runtime:
         ledger, checkouts, _, _ = await self.bind()
         # 1. Poll and Message wakes share one worker and one bounded progress map.
         async with self._cleanup_lock:
-            await run_file_io(lambda: self._cleanup_completed(
-                catalog, projection, heads, ledger=ledger, checkouts=checkouts,
-            ))
+            # Model call stats are optional: borrowed on the loop for this pass, absent without the models plugin.
+            with self._ctx.borrow(MODEL_CALL_STATS) as stats:
+                await run_file_io(lambda: self._cleanup_completed(
+                    catalog, projection, heads, ledger=ledger, checkouts=checkouts, stats=stats,
+                ))
 
     def _cleanup_completed(
         self, catalog: MessageCatalog, projection: TurnProjection,
         heads: Mapping[str, int] | None,
         *, ledger: EventLedger, checkouts: CheckoutManager,
+        stats: Callable[[str], ModelCallStats] | None = None,
     ) -> None:
         """Delete completed checkouts before settling their durable event records."""
         events = ledger.dispatched_events()
@@ -247,6 +255,7 @@ class Runtime:
             for event in events if event.event_key in self._cleanup_heads
         }
         turns: dict[str, tuple[Turn, ...]] = {}
+        snapshots: dict[str, tuple[Message, ...]] = {}
         # 2. Unrelated sessions do not trigger reads; each changed session is projected once.
         for event in events:
             if event.thread_id is None or event.input_message_id is None:
@@ -259,6 +268,7 @@ class Runtime:
                     messages = catalog.reader(event.thread_id).snapshot(through_seq=head)
                 except (KeyError, ValueError):
                     continue
+                snapshots[event.thread_id] = messages
                 turns[event.thread_id] = projection.project(messages, "programmatic")
             turn = next((
                 turn for turn in turns[event.thread_id]
@@ -272,6 +282,66 @@ class Runtime:
                 logger.debug("github-watch checkout already absent event=%s", event.event_key)
             ledger.transition(event.event_key, expected=("dispatched",), status="completed")
             self._cleanup_heads.pop(event.event_key, None)
+            # 4. Usage is settled after completion so a stats failure can never hold the event back.
+            if stats is not None:
+                self._record_usage(event, turn, snapshots[event.thread_id], stats)
+
+    def _record_usage(
+        self, event: EventState, turn: Turn, messages: Iterable[Message],
+        stat: Callable[[str], ModelCallStats],
+    ) -> None:
+        """Settle one event's inference cost; a failure here must not block completion."""
+
+        usage = self._usage
+        if usage is None:
+            return
+        try:
+            record = measure_turn(
+                turn=turn,
+                messages=messages,
+                stat=stat,
+                event_key=event.event_key,
+                repo=event.repo,
+                kind=event.kind,
+                number=event.number,
+                trigger_kind=event.trigger_kind,
+                session_id=event.thread_id or "",
+                recorded_at=_now(),
+            )
+            usage.append(record)
+        except Exception:  # noqa: BLE001 - statistics are best effort; missing call records raise KeyError
+            logger.warning(
+                "github-watch usage record failed event=%s", event.event_key, exc_info=True
+            )
+
+    async def usage_report(
+        self, *, repo: str | None, number: int | None, limit: int,
+    ) -> object:
+        """Summarize settled inference usage; filters apply before aggregation."""
+
+        ledger = self._usage
+        if ledger is None:
+            await self.bind()
+            ledger = self._usage
+        if ledger is None:
+            raise RuntimeError("usage ledger unavailable")
+        records = [
+            record for record in await run_file_io(ledger.records)
+            if (repo is None or record.repo == repo)
+            and (number is None or record.number == number)
+        ]
+        report = summarize(records)
+        objects = cast(list[Mapping[str, object]], report["objects"])
+        return {
+            "totals": report["totals"],
+            "objects": objects[:limit],
+            "truncated": max(0, len(objects) - limit),
+            "note": (
+                "token 只统计 provider 返回 exact 用量的调用；excluded_calls 为被排除的调用数。"
+                "同一 Issue/PR 使用稳定 Session，后续 turn 会带着完整历史，"
+                "因此总量是累积值而非单次成本。"
+            ),
+        }
 
     async def authorize(self, operation_id: str, session_id: str, *, code: bool = False) -> EventState:
         """从耐久账本读取归属，再在普通 Tool 边界核对本次来源。"""
@@ -318,6 +388,12 @@ class GitHubTool:
             if arguments:
                 raise InvalidArguments("runtime info 不接受参数")
             return {}
+        if self._action == "usage":
+            # Read-only: it inspects local records and never needs an operation.
+            try:
+                return UsageQuery.model_validate(json_value(arguments)).model_dump(mode="json")
+            except ValidationError as error:
+                raise InvalidArguments(str(error)) from error
         model = _MODELS[self._action]
         try:
             request = cast(OperationInput, model.model_validate(json_value(arguments)))
@@ -346,6 +422,12 @@ class GitHubTool:
                 "checkout_mode": "detached-commit",
                 "mirror_recovery": "worktree-prune-before-fetch",
             }
+        elif self._action == "usage":
+            value = await self._runtime.usage_report(
+                repo=cast("str | None", arguments.get("repo")),
+                number=cast("int | None", arguments.get("number")),
+                limit=cast(int, arguments.get("limit", 20)),
+            )
         else:
             session_id = arguments.get("_session_id")
             operation_id = arguments.get("operation_id")
@@ -363,6 +445,19 @@ class GitHubTool:
         return None
 
 
+def _now() -> str:
+    """Settlement timestamp in UTC ISO form, matching the ledger's convention."""
+
+    return datetime.now(UTC).isoformat()
+
+
+class UsageQuery(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    repo: str | None = Field(default=None, description="只统计该仓库，如 owner/name")
+    number: int | None = Field(default=None, description="只看这个 Issue/PR 编号")
+    limit: int = Field(default=20, ge=1, le=200, description="最多返回多少个对象")
+
+
 def _definitions() -> tuple[tuple[str, str, Mapping[str, object], str], ...]:
     return (
         ("github_watch_runtime_info", "返回 GitHub Watch 版本和 checkout 恢复策略。",
@@ -375,12 +470,17 @@ def _definitions() -> tuple[tuple[str, str, Mapping[str, object], str], ...]:
          PushInput.model_json_schema(), "push_branch"),
         ("github_watch_create_pr", "为当前 operation 已推送分支创建 GitHub PR。",
          PullInput.model_json_schema(), "create_pr"),
+        ("github_watch_usage",
+         "按 Issue/PR 汇总推理用量：turn 数、调用数、输入/缓存命中/输出 tokens、命中率，"
+         "并给出全部对象的合计与每次 turn 平均。用量只统计 provider 返回 exact 的调用，"
+         "excluded_calls 是被排除的调用数。",
+         UsageQuery.model_json_schema(), "usage"),
     )
 
 
 api_version = 3
 name = "github-watch"
-version = "4.0.2"
+version = "4.1.0"
 desc = "轮询 GitHub，以 programmatic Message 启动工作并提供受约束的 GitHub 工具。"
 inject = (TIMERS, PROGRAMMATIC, MESSAGE_CATALOG, TURN_PROJECTION, TOOLS)
 

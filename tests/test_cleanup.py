@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import threading
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -37,7 +37,8 @@ def state(tmp_path):
     inputs = log.writer("s", author="user", source="programmatic", body_types=(Input,), content={})
     outputs = log.writer("s", author="assistant", source="programmatic", body_types=(Output,), content={})
     removed = []
-    runtime = Runtime(SimpleNamespace(), SimpleNamespace(poll_seconds=15))
+    # No models plugin: optional call stats borrow as None and usage is skipped.
+    runtime = Runtime(SimpleNamespace(borrow=lambda _key: nullcontext(None)), SimpleNamespace(poll_seconds=15))
     runtime._bound = (ledger, SimpleNamespace(cleanup=lambda key: removed.append(key) or True), None, None)
     try:
         yield runtime, ledger, log, inputs, outputs, removed
@@ -154,6 +155,9 @@ async def test_poll_checks_dispatch_that_arrived_after_message_wake(state):
         @asynccontextmanager
         async def runtime_scope(self):
             yield
+
+        def borrow(self, _key):
+            return nullcontext(None)
 
         def require(self, key):
             if key == MESSAGE_CATALOG:
