@@ -36,6 +36,26 @@ GitHub 自动任务也走这条路径；operation 与真实 Message 来源校验
 - `github_watch_submit_review`
 - `github_watch_push_branch`
 - `github_watch_create_pr`
+- `github_watch_usage`
+
+## 推理用量
+
+每个事件在 turn 闭合、checkout 清理之后结算一次，写入 `usage.jsonl`（每行一条，按 `event_key` 去重）。因为一个 Issue/PR 固定一个 programmatic Session，一次结算就对应一个对象。
+
+```bash
+# 全部对象
+github_watch_usage {}
+
+# 单个 PR
+github_watch_usage {"repo": "owner/name", "number": 1589}
+```
+
+返回 `totals`（合计、命中率、每次 turn 平均）与 `events`（按输入 tokens 降序）。字段口径：
+
+- 只统计 provider 返回 `coverage == "exact"` 的调用；`excluded_calls` 是被排除的调用数
+- `hit_rate` = `cached_input_tokens / input_tokens`
+- 同一对象后续 turn 会带上完整历史，总量是**累积值**，不是单次成本
+- 不含价格换算：不同 provider 的缓存读写计价不同，token 数比金额更可比
 
 ## 配置
 
