@@ -120,7 +120,6 @@ REVIEW_MODEL = ModelUse("github_watch", "GitHub 代码评审")
 
 SETTINGS_FORM = SettingsForm(
     title="GitHub Watch", description="轮询关注的仓库，被 @ 提及或请求评审时在对应 PR 的会话里工作。",
-    family="github", family_label="GitHub",
     fields=(
         SettingsField("model", "评审用的模型", kind="model", use=REVIEW_MODEL,
                       hint="回复提及、审 PR 时用；没指定就跟随默认模型"),
