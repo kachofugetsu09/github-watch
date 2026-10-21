@@ -40,7 +40,7 @@ GitHub 自动任务也走这条路径；operation 与真实 Message 来源校验
 
 ## 推理用量
 
-每个事件在 turn 闭合、checkout 清理之后结算一次，写入 `usage.jsonl`（每行一条，按 `event_key` 去重）。因为一个 Issue/PR 固定一个 programmatic Session，一次结算就对应一个对象。
+每个事件在 turn 闭合并标记完成之后结算一次，写入 `usage.jsonl`（每行一条，按 `event_key` 去重），只计该 turn 自己的模型调用。一个 Issue/PR 的 opened、ready 和每条评论各是一个事件，查询时按 Issue/PR 聚合。统计依赖 models 插件；未安装时 GitHub Watch 照常工作，只是不记用量。结算失败只记日志，不影响事件完成。
 
 ```bash
 # 全部对象
@@ -50,7 +50,7 @@ github_watch_usage {}
 github_watch_usage {"repo": "owner/name", "number": 1589}
 ```
 
-返回 `totals`（合计、命中率、每次 turn 平均）与 `events`（按输入 tokens 降序）。字段口径：
+返回 `totals`（合计、命中率、每次 turn 平均）与 `objects`（每个 Issue/PR 一项，按输入 tokens 降序）。字段口径：
 
 - 只统计 provider 返回 `coverage == "exact"` 的调用；`excluded_calls` 是被排除的调用数
 - `hit_rate` = `cached_input_tokens / input_tokens`

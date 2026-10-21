@@ -27,11 +27,11 @@ logger = logging.getLogger("plugin.github-watch")
 # spends one turn on load_tools before it can publish anything.
 TOOL_SIGNATURES = """
 工具签名（已内联，无需 load_tools 即可调用；参数用 tool_call 的 arguments 传）：
-- github_watch_runtime_info {{}} —— 版本与 checkout 恢复策略。
-- github_watch_post_comment {{operation_id: 32 位 hex, body: 非空字符串}}
-- github_watch_submit_review {{operation_id: 32 位 hex, body: 非空字符串}}
-- github_watch_push_branch {{operation_id: 32 位 hex, branch_suffix: 非空字符串}}
-- github_watch_create_pr {{operation_id: 32 位 hex, title: 非空字符串, body: 非空字符串}}
+- github_watch_runtime_info {} —— 版本与 checkout 恢复策略。
+- github_watch_post_comment {operation_id: 32 位 hex, body: 非空字符串}
+- github_watch_submit_review {operation_id: 32 位 hex, body: 非空字符串}
+- github_watch_push_branch {operation_id: 32 位 hex, branch_suffix: 非空字符串}
+- github_watch_create_pr {operation_id: 32 位 hex, title: 非空字符串, body: 非空字符串}
 operation_id 一律填上面「操作标识」那一行的值，不要自己编造。
 """
 
@@ -426,7 +426,7 @@ class GitHubWatch:
 临时仓库: {checkout_path}
 
 你处在这个 Issue/PR 的稳定专用 Session 中，上一次评论和完整历史都在该 Session 与本次证据包中。
-先读 manifest 和全部证据，再只在临时仓库中读取、测试或修改，以新鲜 GitHub 证据为准。
+先读 manifest 和 files.json 改动清单，按需打开 patches/ 下的补丁，再只在临时仓库中读取、测试或修改，以新鲜 GitHub 证据为准。
 files.json 只是改动清单（文件名、状态、增删行数、has_patch），每个文件的 diff 单独放在
 patches/ 目录，文件名带序号前缀；manifest 的 patches 字段列出了每个补丁的路径与摘要。
 补丁缺失（has_patch 为 false）表示 GitHub 未提供该文件 diff（大文件或二进制），

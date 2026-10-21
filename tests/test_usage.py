@@ -71,7 +71,12 @@ def test_call_ids_dedupes_and_ignores_other_parts() -> None:
 
 
 def test_measure_turn_sums_exact_usage_and_counts_excluded() -> None:
-    messages = [FakeMessage("m1", ("call-a", "call-b")), FakeMessage("m2", ("call-c",))]
+    # m0 belongs to an earlier turn of the same stable session and must not be re-counted.
+    messages = [
+        FakeMessage("m0", ("call-old",)),
+        FakeMessage("m1", ("call-a", "call-b")),
+        FakeMessage("m2", ("call-c",)),
+    ]
     lookup = stats_for({
         "call-a": call_stats(
             "call-a", model="deepseek-v4-flash", coverage="exact",
@@ -125,25 +130,26 @@ def test_ledger_appends_once_per_event_and_survives_torn_line(tmp_path) -> None:
     assert {record.number for record in ledger.records()} == {1, 2}
 
 
-def test_summarize_groups_per_event_and_averages_per_turn() -> None:
+def test_summarize_groups_per_object_and_averages_per_turn() -> None:
+    # Two events of PR 1 (opened, then a comment) aggregate into one object.
     records = [
         _usage("owner/repo:pr:1:opened", number=1, input_tokens=1000, cached=900, output=10),
-        _usage("owner/repo:pr:1:opened", number=1, input_tokens=500, cached=400, output=5),
+        _usage("owner/repo:pr:1:comment:9", number=1, input_tokens=500, cached=400, output=5),
         _usage("owner/repo:pr:2:opened", number=2, input_tokens=2000, cached=1000, output=20),
     ]
     report = summarize(records)
     totals = report["totals"]
-    assert totals["events"] == 2 and totals["turns"] == 3
+    assert totals["objects"] == 2 and totals["turns"] == 3
     assert totals["input_tokens"] == 3500
     assert totals["cached_input_tokens"] == 2300
     assert abs(totals["hit_rate"] - 2300 / 3500) < 1e-9
     assert abs(totals["average_per_turn"]["input_tokens"] - 3500 / 3) < 1e-9
 
     # Sorted by input tokens so the most expensive object comes first.
-    events = report["events"]
-    assert [item["number"] for item in events] == [2, 1]
-    assert events[0]["hit_rate"] == 0.5
-    assert events[1]["turns"] == 2
+    objects = report["objects"]
+    assert [item["number"] for item in objects] == [2, 1]
+    assert objects[0]["hit_rate"] == 0.5
+    assert objects[1]["turns"] == 2
 
 
 def _usage(

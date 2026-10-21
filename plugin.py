@@ -141,7 +141,6 @@ class Runtime:
         self._cleanup_lock = asyncio.Lock()
         self._cleanup_heads: dict[str, int] = {}
         self._usage: UsageLedger | None = None
-        self._call_stats: Callable[[str], ModelCallStats] | None = None
 
     async def bind(self) -> tuple[EventLedger, CheckoutManager, GitHubOperations, GitHubWatch]:
         """在正式 loop 取得路径，实际状态打开和恢复结束后才发布本代资源。"""
@@ -235,14 +234,17 @@ class Runtime:
         ledger, checkouts, _, _ = await self.bind()
         # 1. Poll and Message wakes share one worker and one bounded progress map.
         async with self._cleanup_lock:
-            await run_file_io(lambda: self._cleanup_completed(
-                catalog, projection, heads, ledger=ledger, checkouts=checkouts,
-            ))
+            # Model call stats are optional: borrowed on the loop for this pass, absent without the models plugin.
+            with self._ctx.borrow(MODEL_CALL_STATS) as stats:
+                await run_file_io(lambda: self._cleanup_completed(
+                    catalog, projection, heads, ledger=ledger, checkouts=checkouts, stats=stats,
+                ))
 
     def _cleanup_completed(
         self, catalog: MessageCatalog, projection: TurnProjection,
         heads: Mapping[str, int] | None,
         *, ledger: EventLedger, checkouts: CheckoutManager,
+        stats: Callable[[str], ModelCallStats] | None = None,
     ) -> None:
         """Delete completed checkouts before settling their durable event records."""
         events = ledger.dispatched_events()
@@ -278,17 +280,20 @@ class Runtime:
             # 3. Failed deletion must remain dispatched so restart can retry it.
             if not checkouts.cleanup(event.operation_id):
                 logger.debug("github-watch checkout already absent event=%s", event.event_key)
-            # 4. Record inference usage while the closed turn and its messages are in hand.
-            self._record_usage(event, turn, snapshots[event.thread_id])
             ledger.transition(event.event_key, expected=("dispatched",), status="completed")
             self._cleanup_heads.pop(event.event_key, None)
+            # 4. Usage is settled after completion so a stats failure can never hold the event back.
+            if stats is not None:
+                self._record_usage(event, turn, snapshots[event.thread_id], stats)
 
-    def _record_usage(self, event: EventState, turn: Turn, messages: Iterable[Message]) -> None:
+    def _record_usage(
+        self, event: EventState, turn: Turn, messages: Iterable[Message],
+        stat: Callable[[str], ModelCallStats],
+    ) -> None:
         """Settle one event's inference cost; a failure here must not block completion."""
 
         usage = self._usage
-        stat = self._call_stats
-        if usage is None or stat is None:
+        if usage is None:
             return
         try:
             record = measure_turn(
@@ -304,7 +309,7 @@ class Runtime:
                 recorded_at=_now(),
             )
             usage.append(record)
-        except (OSError, RuntimeError, TypeError, ValueError):
+        except Exception:  # noqa: BLE001 - statistics are best effort; missing call records raise KeyError
             logger.warning(
                 "github-watch usage record failed event=%s", event.event_key, exc_info=True
             )
@@ -326,11 +331,11 @@ class Runtime:
             and (number is None or record.number == number)
         ]
         report = summarize(records)
-        events = cast(list[Mapping[str, object]], report["events"])
+        objects = cast(list[Mapping[str, object]], report["objects"])
         return {
             "totals": report["totals"],
-            "events": events[:limit],
-            "truncated": max(0, len(events) - limit),
+            "objects": objects[:limit],
+            "truncated": max(0, len(objects) - limit),
             "note": (
                 "token 只统计 provider 返回 exact 用量的调用；excluded_calls 为被排除的调用数。"
                 "同一 Issue/PR 使用稳定 Session，后续 turn 会带着完整历史，"
@@ -477,7 +482,7 @@ api_version = 3
 name = "github-watch"
 version = "4.1.0"
 desc = "轮询 GitHub，以 programmatic Message 启动工作并提供受约束的 GitHub 工具。"
-inject = (TIMERS, PROGRAMMATIC, MESSAGE_CATALOG, TURN_PROJECTION, TOOLS, MODEL_CALL_STATS)
+inject = (TIMERS, PROGRAMMATIC, MESSAGE_CATALOG, TURN_PROJECTION, TOOLS)
 
 
 GITHUB_WATCH_TOOLS = ServiceKey[ToolView]("github-watch.tools.v1")
@@ -506,9 +511,6 @@ async def apply(ctx: Context) -> None:
 
     async def start(_event: object) -> None:
         nonlocal watcher
-        # Model call statistics are borrowed at runtime start; the candidate Root
-        # never touches them.
-        runtime._call_stats = ctx.require(MODEL_CALL_STATS)
         await runtime.bind()
         watcher = await ctx.spawn(runtime.run(), name="github-watch")
 

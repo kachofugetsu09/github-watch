@@ -211,7 +211,7 @@ async def test_real_manager_message_tool_db_uses_local_github_endpoint(
                 loaded_result = await menu.execute(CallRef("github-load", 0))
                 assert loaded_result.outcome == "success"
                 loaded_tools = json.loads(loaded_result.parts[0].value)["tools"]
-                assert len(loaded_tools) == 5
+                assert len(loaded_tools) == 6
                 assert all(
                     schema["function"]["name"].startswith("github_watch_")
                     for schema in loaded_tools

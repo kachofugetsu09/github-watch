@@ -127,6 +127,10 @@ def measure_turn(
 ) -> TurnUsage:
     """Sum exact provider usage for one turn; count the calls that had none."""
 
+    # Only this turn's messages: the stable session snapshot also holds every
+    # earlier turn, whose calls were already settled with their own events.
+    members = set(turn.message_ids)
+    messages = [message for message in messages if message.message_id in members]
     totals = {
         "input_tokens": 0,
         "cached_input_tokens": 0,
@@ -219,14 +223,14 @@ class UsageLedger:
 
 
 def summarize(records: Iterable[TurnUsage]) -> dict[str, Any]:
-    """Aggregate per-PR totals plus the overall and per-turn averages."""
+    """Aggregate per Issue/PR totals plus the overall and per-turn averages."""
 
-    per_event: dict[str, dict[str, Any]] = {}
+    # One entry per Issue/PR: each event_key (opened, ready, every comment) is one turn of it.
+    per_object: dict[tuple[str, str, int], dict[str, Any]] = {}
     for usage in records:
-        entry = per_event.setdefault(
-            usage.event_key,
+        entry = per_object.setdefault(
+            (usage.repo, usage.kind, usage.number),
             {
-                "event_key": usage.event_key,
                 "repo": usage.repo,
                 "kind": usage.kind,
                 "number": usage.number,
@@ -263,23 +267,23 @@ def summarize(records: Iterable[TurnUsage]) -> dict[str, Any]:
         entry["first_recorded_at"] = min(entry["first_recorded_at"], usage.recorded_at)
         entry["last_recorded_at"] = max(entry["last_recorded_at"], usage.recorded_at)
 
-    events = []
-    for entry in per_event.values():
+    objects = []
+    for entry in per_object.values():
         total_input = entry["input_tokens"]
         entry["hit_rate"] = None if total_input <= 0 else entry["cached_input_tokens"] / total_input
-        events.append(entry)
-    events.sort(key=lambda item: (-item["input_tokens"], item["repo"], item["number"]))
+        objects.append(entry)
+    objects.sort(key=lambda item: (-item["input_tokens"], item["repo"], item["number"]))
 
     totals: dict[str, Any] = {
-        "events": len(events),
-        "turns": sum(item["turns"] for item in events),
-        "calls": sum(item["calls"] for item in events),
-        "excluded_calls": sum(item["excluded_calls"] for item in events),
-        "input_tokens": sum(item["input_tokens"] for item in events),
-        "cached_input_tokens": sum(item["cached_input_tokens"] for item in events),
-        "cache_write_input_tokens": sum(item["cache_write_input_tokens"] for item in events),
-        "output_tokens": sum(item["output_tokens"] for item in events),
-        "reasoning_output_tokens": sum(item["reasoning_output_tokens"] for item in events),
+        "objects": len(objects),
+        "turns": sum(item["turns"] for item in objects),
+        "calls": sum(item["calls"] for item in objects),
+        "excluded_calls": sum(item["excluded_calls"] for item in objects),
+        "input_tokens": sum(item["input_tokens"] for item in objects),
+        "cached_input_tokens": sum(item["cached_input_tokens"] for item in objects),
+        "cache_write_input_tokens": sum(item["cache_write_input_tokens"] for item in objects),
+        "output_tokens": sum(item["output_tokens"] for item in objects),
+        "reasoning_output_tokens": sum(item["reasoning_output_tokens"] for item in objects),
     }
     total_input = totals["input_tokens"]
     totals["hit_rate"] = None if total_input <= 0 else totals["cached_input_tokens"] / total_input
@@ -288,4 +292,4 @@ def summarize(records: Iterable[TurnUsage]) -> dict[str, Any]:
         field: (totals[field] / turns if turns else None)
         for field in ("input_tokens", "cached_input_tokens", "output_tokens")
     }
-    return {"totals": totals, "events": events}
+    return {"totals": totals, "objects": objects}
