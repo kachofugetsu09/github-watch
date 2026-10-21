@@ -293,3 +293,56 @@ def summarize(records: Iterable[TurnUsage]) -> dict[str, Any]:
         for field in ("input_tokens", "cached_input_tokens", "output_tokens")
     }
     return {"totals": totals, "objects": objects}
+
+
+# Panel replies are capped at 192 KiB by the host; keep rows small and bounded.
+# 宿主插件 UI 回包上限 192 KiB；每行约 0.2 KiB，三档查询都远低于上限。
+_PANEL_REPOS = 30
+_PANEL_PREVIEW = 8
+_PANEL_OBJECTS = 200
+_PANEL_TURNS = 100
+_PANEL_MODELS = 4
+_PANEL_FIELDS = ("kind", "number", "turns", "calls", "input_tokens", "cached_input_tokens", "output_tokens",
+                 "hit_rate", "last_recorded_at")
+
+
+def panel_repos(records: Iterable[TurnUsage]) -> dict[str, Any]:
+    """Repo -> Issue/PR rows for the sidebar panel; each repo previews its top objects, the rest via panel_objects."""
+
+    by_repo: dict[str, list[TurnUsage]] = {}
+    for usage in records:
+        by_repo.setdefault(usage.repo, []).append(usage)
+    repos = []
+    for repo, owned in by_repo.items():
+        report = summarize(owned)
+        objects = report["objects"]
+        repos.append({
+            "repo": repo, "totals": report["totals"], "more": max(0, len(objects) - _PANEL_PREVIEW),
+            "objects": [{name: item[name] for name in _PANEL_FIELDS} for item in objects[:_PANEL_PREVIEW]],
+        })
+    repos.sort(key=lambda item: -item["totals"]["input_tokens"])
+    return {"totals": summarize(record for owned in by_repo.values() for record in owned)["totals"],
+            "repos": repos[:_PANEL_REPOS], "more": max(0, len(repos) - _PANEL_REPOS)}
+
+
+def panel_objects(records: Iterable[TurnUsage], repo: str) -> dict[str, Any]:
+    """All Issue/PR rows of one repo, up to _PANEL_OBJECTS."""
+
+    objects = summarize(usage for usage in records if usage.repo == repo)["objects"]
+    return {"repo": repo, "more": max(0, len(objects) - _PANEL_OBJECTS),
+            "objects": [{name: item[name] for name in _PANEL_FIELDS} for item in objects[:_PANEL_OBJECTS]]}
+
+
+def panel_turns(records: Iterable[TurnUsage], repo: str, number: int) -> dict[str, Any]:
+    """One Issue/PR's turns in time order, the latest _PANEL_TURNS of them."""
+
+    owned = sorted((usage for usage in records if usage.repo == repo and usage.number == number),
+                   key=lambda usage: usage.recorded_at)
+    return {
+        "session_id": owned[-1].session_id if owned else None,
+        "turns": [{
+            "trigger_kind": usage.trigger_kind, "recorded_at": usage.recorded_at, "models": list(usage.models[:_PANEL_MODELS]),
+            "calls": usage.calls, "input_tokens": usage.input_tokens, "cached_input_tokens": usage.cached_input_tokens,
+            "output_tokens": usage.output_tokens, "excluded_calls": usage.excluded_calls,
+        } for usage in owned[-_PANEL_TURNS:]],
+    }

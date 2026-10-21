@@ -1,0 +1,33 @@
+/* GitHub Watch 用量面板：版式与宿主用量面板一致，数字等宽。 */
+.gw-panel, .gw-pane, .gw-detail { display: grid; align-content: start; gap: 12px; min-width: 0; }
+.gw-panel { height: 100%; padding: 12px; color: var(--chat-ink); font-size: var(--chat-type-control); box-sizing: border-box; }
+.gw-split { grid-template-columns: minmax(16rem, 2fr) minmax(0, 3fr); gap: 24px; overflow: hidden; }
+.gw-split > .gw-pane { overflow: auto; min-height: 0; }
+.gw-pad { padding: 12px; }
+.gw-kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(7rem, 1fr)); gap: 12px; }
+.gw-metric { display: grid; gap: 2px; min-width: 0; }
+.gw-metric b { font-size: 1.375rem; font-weight: 600; line-height: 1.1; font-variant-numeric: tabular-nums; }
+.gw-metric span, .gw-note { color: var(--chat-faint); font-size: var(--chat-type-caption); }
+.gw-note { margin: 0; }
+.gw-title { font-weight: 600; overflow-wrap: anywhere; }
+.gw-list { display: grid; min-width: 0; }
+.gw-repo, .gw-item { display: grid; grid-template-columns: minmax(0, 1fr) auto; column-gap: 12px; padding: 6px 8px; }
+.gw-repo { margin-top: 8px; border-bottom: 1px solid var(--chat-rule, var(--ak-rule-subtle)); font-weight: 600; grid-template-columns: minmax(0, 1fr) auto auto; }
+.gw-repo:first-child { margin-top: 0; }
+.gw-item { border: 0; border-radius: 6px; background: none; color: inherit; font: inherit; text-align: start; }
+button.gw-item { cursor: pointer; min-height: 36px; }
+button.gw-item:hover, .gw-item[aria-current] { background: var(--chat-chip); }
+.gw-item .t, .gw-repo .t { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.gw-item .n, .gw-repo .n { text-align: end; font-variant-numeric: tabular-nums; }
+.gw-item .s { color: var(--chat-faint); font-size: var(--chat-type-caption); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.gw-item .s + .n { color: var(--chat-faint); font-size: var(--chat-type-caption); }
+.gw-bars { display: flex; height: 96px; align-items: flex-end; gap: 2px; min-width: 0; }
+.gw-bars > span { display: flex; max-width: 12px; min-width: 2px; height: 100%; flex: 1 1 0; flex-direction: column-reverse; }
+/* 与宿主用量面板同一套：未命中为主蓝，命中为浅墨。 */
+.gw-bars i { display: block; background: light-dark(#2a78d6, #3987e5); }
+.gw-bars i.soft { background: color-mix(in oklab, var(--chat-ink) 22%, transparent); }
+.gw-back { justify-self: start; min-height: 44px; border: 0; background: none; color: inherit; font: inherit; cursor: pointer; }
+@media (max-width: 720px) { .gw-split { grid-template-columns: 1fr; } }
+.gw-more { all: unset; cursor: pointer; padding: 6px 8px; font-size: 12px; color: var(--chat-faint); }
+.gw-more:hover { color: var(--chat-ink); }
+.gw-more:focus-visible { outline: 2px solid var(--chat-focus, currentColor); outline-offset: 2px; border-radius: 6px; }
