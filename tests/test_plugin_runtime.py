@@ -319,12 +319,12 @@ def test_programmatic_admission_carries_memory_scope() -> None:
     async def model():
         raise AssertionError("admit 不应读取模型")
 
-    messages = _ProgrammaticMessages(api, model, "github-watch")
+    messages = _ProgrammaticMessages(api, model, "p_2a1a417ce3e67ae1ad3bfa26d4b9985a")
     asyncio.run(messages.admit("programmatic:github-watch:fixture"))
 
     assert len(api.calls) == 1
     method, params = api.calls[0]
     assert method == "programmatic/session/admit"
     assert isinstance(params, AdmitParams)
-    assert params.scope == {"project": "github-watch"}
+    assert params.scope == {"project": "p_2a1a417ce3e67ae1ad3bfa26d4b9985a"}
     assert params.persist_memory is False

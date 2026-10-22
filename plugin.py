@@ -62,10 +62,12 @@ class GitHubWatchConfig(BaseModel):
     checkout_ttl_seconds: int = Field(default=86_400, ge=300)
     notify_channel: str | None = None
     notify_chat_id: str | None = None
-    # 记忆范围：让每次评审落在一个不学习、也不召回的 Akasha scope 里。
-    # 关掉召回是重点——`persist_memory=False` 只停写，读仍由 scope 的 recall 策略决定，
-    # 没有 scope 时默认允许读，于是每轮都把整份记忆注入进上下文。
-    memory_scope: str = Field(default="github-watch", min_length=1, max_length=128)
+    # 评审会话归属的 Akasha 项目，也是它们的记忆范围。
+    # 必须是真实存在的 project ID：project 维度由 projects 插件独占注册并校验存在性。
+    # 该项目应设为不学习、不召回——`persist_memory=False` 只停写，读仍由 scope 的
+    # recall 策略决定，没有范围时默认允许读，于是每轮都把整份记忆注入进上下文。
+    project_id: str = Field(default="p_2a1a417ce3e67ae1ad3bfa26d4b9985a",
+                            pattern=r"^p_[0-9a-f]{32}$")
     # 评审用的模型；没指定就跟随全局默认模型，指定的不可用时也回到默认。
     model: ModelChoice = ModelChoice(follow="default")
 
@@ -238,7 +240,7 @@ class Runtime:
                     await watch.poll(
                         self._config.repositories,
                         _ProgrammaticMessages(self._ctx.require(PROGRAMMATIC), self.review_model,
-                                              getattr(self._config, "memory_scope", "github-watch")),
+                                              getattr(self._config, "project_id", "p_2a1a417ce3e67ae1ad3bfa26d4b9985a")),
                     )
             except asyncio.CancelledError:
                 raise
