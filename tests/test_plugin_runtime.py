@@ -296,3 +296,35 @@ async def test_real_manager_message_tool_db_uses_local_github_endpoint(
                 assert len(comments) == 1
             finally:
                 await restarted.terminate_all()
+
+
+def test_programmatic_admission_carries_memory_scope() -> None:
+    """评审 Session 必须落在不召回的 scope 里，否则每轮都注入整份记忆。
+
+    `persist_memory=False` 只关写；读由 Akasha 的 scope recall 策略决定，
+    没有 scope 时默认允许读。这里验证适配器确实把 scope 带进了准入参数。
+    """
+    from github_watch_test_package.plugin import _ProgrammaticMessages  # pyright: ignore[reportMissingImports]
+
+    class _RecordingProgrammatic:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, AdmitParams | SendParams]] = []
+
+        async def call(self, method: str, params: AdmitParams | SendParams, transport=None):  # pyright: ignore[reportMissingParameterType]
+            self.calls.append((method, params))
+            return {"session_id": params.session_id, "message_id": getattr(params, "message_id", None)}
+
+    api = _RecordingProgrammatic()
+
+    async def model():
+        raise AssertionError("admit 不应读取模型")
+
+    messages = _ProgrammaticMessages(api, model, "github-watch")
+    asyncio.run(messages.admit("programmatic:github-watch:fixture"))
+
+    assert len(api.calls) == 1
+    method, params = api.calls[0]
+    assert method == "programmatic/session/admit"
+    assert isinstance(params, AdmitParams)
+    assert params.scope == {"project": "github-watch"}
+    assert params.persist_memory is False
