@@ -92,10 +92,12 @@ async def scenario(plugin: Any, kind: str, expect_blocking: bool,
             assert live is not None
             # 本场景只验证账本 IO 与回执恢复，不跑模型、不涉及记忆范围：
             # model 用固定抛错的占位，scope 不传（该组合没有 projects 插件）。
-            async def _no_model():
-                raise AssertionError("check_ledger_io 不读取评审模型")
+            # 本场景不跑模型，但 _dispatch_message 会读一次模型选择并冻结进账本；
+            # 返回空选择（跟随默认），不触发任何真实调用。
+            async def _placeholder_model():
+                return plugin.ChatModelSelection()
             port = plugin._ProgrammaticMessages(
-                live.context.require(plugin.PROGRAMMATIC), _no_model,
+                live.context.require(plugin.PROGRAMMATIC), _placeholder_model,
             )
             manifest, checkout = root / "manifest.json", root / "checkout"
             manifest.write_text("{}", encoding="utf-8")
@@ -312,7 +314,7 @@ async def scenario(plugin: Any, kind: str, expect_blocking: bool,
                 fresh = reopened.live_root
                 assert fresh is not None
                 next_port = plugin._ProgrammaticMessages(
-                    fresh.context.require(plugin.PROGRAMMATIC), _no_model,
+                    fresh.context.require(plugin.PROGRAMMATIC), _placeholder_model,
                 )
                 restored = plugin.EventLedger(path)
                 recovery = restored.recover_interrupted()
