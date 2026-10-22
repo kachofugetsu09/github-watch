@@ -8,5 +8,5 @@ poll_seconds = 120
 checkout_ttl_seconds = 86400
 notify_channel = "mobile"
 notify_chat_id = "main-chat-id"
-# 评审 Session 落在哪个 Akasha 记忆范围；该范围应设为不学习、不召回。
-memory_scope = "github-watch"
+# 评审 Session 归属的 Akasha 项目，同时是记忆范围；该项目应设为不学习、不召回。
+project_id = "p_2a1a417ce3e67ae1ad3bfa26d4b9985a"
