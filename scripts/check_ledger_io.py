@@ -90,7 +90,12 @@ async def scenario(plugin: Any, kind: str, expect_blocking: bool,
             ledger.set_thread("owner/repo", "issue", 1, session_id)
             live = host.live_root
             assert live is not None
-            port = plugin._ProgrammaticMessages(live.context.require(plugin.PROGRAMMATIC))
+            # 本场景只验证账本 IO 与回执恢复，不跑模型；model/scope 用固定占位。
+            async def _no_model():
+                raise AssertionError("check_ledger_io 不读取评审模型")
+            port = plugin._ProgrammaticMessages(
+                live.context.require(plugin.PROGRAMMATIC), _no_model, "p_2a1a417ce3e67ae1ad3bfa26d4b9985a",
+            )
             manifest, checkout = root / "manifest.json", root / "checkout"
             manifest.write_text("{}", encoding="utf-8")
             if kind == "recovery_error_cancel":
@@ -305,7 +310,9 @@ async def scenario(plugin: Any, kind: str, expect_blocking: bool,
                 await reopened.start_runtime()
                 fresh = reopened.live_root
                 assert fresh is not None
-                next_port = plugin._ProgrammaticMessages(fresh.context.require(plugin.PROGRAMMATIC))
+                next_port = plugin._ProgrammaticMessages(
+                    fresh.context.require(plugin.PROGRAMMATIC), _no_model, "p_2a1a417ce3e67ae1ad3bfa26d4b9985a",
+                )
                 restored = plugin.EventLedger(path)
                 recovery = restored.recover_interrupted()
                 current = restored.get_event(event.event_key)
