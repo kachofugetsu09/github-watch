@@ -62,6 +62,10 @@ class GitHubWatchConfig(BaseModel):
     checkout_ttl_seconds: int = Field(default=86_400, ge=300)
     notify_channel: str | None = None
     notify_chat_id: str | None = None
+    # 记忆范围：让每次评审落在一个不学习、也不召回的 Akasha scope 里。
+    # 关掉召回是重点——`persist_memory=False` 只停写，读仍由 scope 的 recall 策略决定，
+    # 没有 scope 时默认允许读，于是每轮都把整份记忆注入进上下文。
+    memory_scope: str = Field(default="github-watch", min_length=1, max_length=128)
     # 评审用的模型；没指定就跟随全局默认模型，指定的不可用时也回到默认。
     model: ModelChoice = ModelChoice(follow="default")
 
@@ -137,13 +141,16 @@ SETTINGS_FORM = SettingsForm(
 
 class _ProgrammaticMessages(ProgrammaticMessagePort):
     """Adapt the ordinary programmatic source without inventing a Turn identity."""
-    def __init__(self, api: ProgrammaticService, model: Callable[[], Awaitable[ChatModelSelection]]) -> None:
+    def __init__(self, api: ProgrammaticService, model: Callable[[], Awaitable[ChatModelSelection]],
+                 scope: str) -> None:
         self._api = api
         self._model = model
+        self._scope = scope
 
     async def admit(self, session_id: str) -> None:
         result = await self._api.call(
-            "programmatic/session/admit", AdmitParams(session_id=session_id),
+            "programmatic/session/admit",
+            AdmitParams(session_id=session_id, scope={"project": self._scope}),
         )
         if result.get("session_id") != session_id:
             raise RuntimeError("programmatic Session admission identity mismatch")
@@ -230,7 +237,8 @@ class Runtime:
                     _, _, _, watch = await self.bind()
                     await watch.poll(
                         self._config.repositories,
-                        _ProgrammaticMessages(self._ctx.require(PROGRAMMATIC), self.review_model),
+                        _ProgrammaticMessages(self._ctx.require(PROGRAMMATIC), self.review_model,
+                                              getattr(self._config, "memory_scope", "github-watch")),
                     )
             except asyncio.CancelledError:
                 raise

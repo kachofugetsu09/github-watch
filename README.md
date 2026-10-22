@@ -8,6 +8,7 @@ Akashic API v3 插件。它轮询 GitHub，把可处理事件作为 programmatic
 - 基线后新建的 open Issue/PR、draft PR 转为 ready，以及仓库 owner 新发且包含配置 mention 的 comment 会产生稳定事件；commit、编辑、普通 comment、关闭和合并不会唤醒。
 - 「open 才处理」是整条链路的硬条件，不只在列表请求里成立：发现阶段读到非 open 对象只推进游标，不产生事件；派发前按当前状态复查，排队期间被合并或关闭的事件以 `skipped` 终态结束，不做 checkout、不提交 Message；review 和 comment 发布前再复查一次，对象已不是 open 时返回 `skipped` 与原因（`merged` / `closed` / `deleted`），不写入。状态读取失败时放行，避免丢掉真实结论。
 - 同一 Issue/PR 复用一个确定性 programmatic Session；每个事件使用由 `operation_id` 推导的确定性 Input Message ID。提交返回即结束轮询，不等待模型输出。
+- 这些 Session 都落在 `memory_scope`（默认 `github-watch`）这个 Akasha 记忆范围里。范围应设为不学习、不召回：`persist_memory=False` 只停写，读由 scope 的 recall 策略决定，没有 scope 时默认允许读，会把整份记忆注入每一轮上下文。
 - SQLite 账本持久化事件、operation、Session 和 Input Message identity。进程若在 Message 提交期间退出，启动后用相同 ID 重试，由 Core 的 append 幂等边界消除重复输入。
 - 每个事件构建一份证据包和 detached operation checkout。Message 投影达到终态后删除该 checkout；异常退出由 TTL sweeper 与 worktree prune 回收。
 - Agent 默认只分析。写操作必须由该 programmatic Input 的真实 Tool execution 发起，并携带对应 `operation_id`。只有 owner mention 事件可以 push 或创建 PR。
