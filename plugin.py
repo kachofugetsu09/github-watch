@@ -144,16 +144,17 @@ SETTINGS_FORM = SettingsForm(
 class _ProgrammaticMessages(ProgrammaticMessagePort):
     """Adapt the ordinary programmatic source without inventing a Turn identity."""
     def __init__(self, api: ProgrammaticService, model: Callable[[], Awaitable[ChatModelSelection]],
-                 scope: str) -> None:
+                 scope: str | None = None) -> None:
         self._api = api
         self._model = model
         self._scope = scope
 
     async def admit(self, session_id: str) -> None:
-        result = await self._api.call(
-            "programmatic/session/admit",
-            AdmitParams(session_id=session_id, scope={"project": self._scope}),
-        )
+        # scope 缺省时不传：账本 IO 等不涉及记忆的验证组合没有 projects 插件，
+        # 带上 project 维度会因「维度没有 owner」被拒。
+        params = (AdmitParams(session_id=session_id) if self._scope is None
+                  else AdmitParams(session_id=session_id, scope={"project": self._scope}))
+        result = await self._api.call("programmatic/session/admit", params)
         if result.get("session_id") != session_id:
             raise RuntimeError("programmatic Session admission identity mismatch")
 

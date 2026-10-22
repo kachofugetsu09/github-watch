@@ -90,11 +90,12 @@ async def scenario(plugin: Any, kind: str, expect_blocking: bool,
             ledger.set_thread("owner/repo", "issue", 1, session_id)
             live = host.live_root
             assert live is not None
-            # 本场景只验证账本 IO 与回执恢复，不跑模型；model/scope 用固定占位。
+            # 本场景只验证账本 IO 与回执恢复，不跑模型、不涉及记忆范围：
+            # model 用固定抛错的占位，scope 不传（该组合没有 projects 插件）。
             async def _no_model():
                 raise AssertionError("check_ledger_io 不读取评审模型")
             port = plugin._ProgrammaticMessages(
-                live.context.require(plugin.PROGRAMMATIC), _no_model, "p_2a1a417ce3e67ae1ad3bfa26d4b9985a",
+                live.context.require(plugin.PROGRAMMATIC), _no_model,
             )
             manifest, checkout = root / "manifest.json", root / "checkout"
             manifest.write_text("{}", encoding="utf-8")
@@ -311,7 +312,7 @@ async def scenario(plugin: Any, kind: str, expect_blocking: bool,
                 fresh = reopened.live_root
                 assert fresh is not None
                 next_port = plugin._ProgrammaticMessages(
-                    fresh.context.require(plugin.PROGRAMMATIC), _no_model, "p_2a1a417ce3e67ae1ad3bfa26d4b9985a",
+                    fresh.context.require(plugin.PROGRAMMATIC), _no_model,
                 )
                 restored = plugin.EventLedger(path)
                 recovery = restored.recover_interrupted()
