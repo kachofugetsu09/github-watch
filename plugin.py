@@ -185,6 +185,7 @@ class Runtime:
         self._bind_lock = asyncio.Lock()
         self._cleanup_lock = asyncio.Lock()
         self._cleanup_heads: dict[str, int] = {}
+        self._cleanup_restored = False
         self._usage: UsageLedger | None = None
 
     async def bind(self) -> tuple[EventLedger, CheckoutManager, GitHubOperations, GitHubWatch]:
@@ -303,6 +304,12 @@ class Runtime:
         events = ledger.dispatched_events()
         if heads is None:
             heads = catalog.snapshot_heads()
+        # Failed or unanswered turns stay open and their events stay dispatched; restoring the
+        # checked heads keeps a restart from re-reading every unchanged thread in full.
+        if not self._cleanup_restored:
+            self._cleanup_heads = ledger.cleanup_heads()
+            self._cleanup_restored = True
+        checked: dict[str, int] = {}
         self._cleanup_heads = {
             event.event_key: self._cleanup_heads[event.event_key]
             for event in events if event.event_key in self._cleanup_heads
@@ -328,7 +335,7 @@ class Runtime:
                 if event.input_message_id in turn.message_ids
             ), None)
             if turn is None or turn.status == "open":
-                self._cleanup_heads[event.event_key] = head
+                self._cleanup_heads[event.event_key] = checked[event.event_key] = head
                 continue
             # 3. Failed deletion must remain dispatched so restart can retry it.
             if not checkouts.cleanup(event.operation_id):
@@ -338,6 +345,9 @@ class Runtime:
             # 4. Usage is settled after completion so a stats failure can never hold the event back.
             if stats is not None:
                 self._record_usage(event, turn, snapshots[event.thread_id], stats)
+        # 5. New checks are written back in one transaction; a lost write only costs a re-read on restart.
+        if checked:
+            ledger.record_cleanup_heads(checked)
 
     def _record_usage(
         self, event: EventState, turn: Turn, messages: Iterable[Message],

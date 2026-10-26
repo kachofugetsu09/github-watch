@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import sqlite3
 import uuid
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from contextlib import closing, contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -337,6 +337,23 @@ class EventLedger:
             )
         return proposed
 
+    def cleanup_heads(self) -> dict[str, int]:
+        """返回仍在等待终态的事件上次检查到的会话 head；重启后同一 head 不必重读。"""
+        with self._connect() as connection:
+            rows = connection.execute("""
+                SELECT event_key, cleanup_head FROM events
+                WHERE status = 'dispatched' AND cleanup_head IS NOT NULL
+                """).fetchall()
+        return {str(key): int(head) for key, head in rows}
+
+    def record_cleanup_heads(self, heads: Mapping[str, int]) -> None:
+        """一个事务记下本轮检查到的 head；已离开 dispatched 的事件不再写。"""
+        with self._connect() as connection:
+            connection.executemany(
+                "UPDATE events SET cleanup_head = ? WHERE event_key = ? AND status = 'dispatched'",
+                [(head, key) for key, head in heads.items()],
+            )
+
     def transition(
         self,
         event_key: str,
@@ -436,6 +453,8 @@ class EventLedger:
             connection.execute("ALTER TABLE events ADD COLUMN input_message_id TEXT")
         if "model_pin" not in event_columns:
             connection.execute("ALTER TABLE events ADD COLUMN model_pin TEXT")
+        if "cleanup_head" not in event_columns:
+            connection.execute("ALTER TABLE events ADD COLUMN cleanup_head INTEGER")
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
