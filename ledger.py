@@ -337,14 +337,13 @@ class EventLedger:
             )
         return proposed
 
-    def cleanup_heads(self, revision: int | None) -> dict[str, int]:
-        """返回同一消息前缀下检查过的会话 head；前缀改写过或无法确认时清空，全部重新判断。"""
+    def cleanup_heads(self, revision: int) -> dict[str, int]:
+        """返回同一消息前缀 revision 下检查过的会话 head；revision 不同时一律不复用。"""
         with self._connect() as connection:
             stored = connection.execute(
                 "SELECT value FROM meta WHERE key = 'cleanup_prefix_revision'"
             ).fetchone()
-            if revision is None or stored is None or stored[0] != str(revision):
-                connection.execute("UPDATE events SET cleanup_head = NULL WHERE cleanup_head IS NOT NULL")
+            if stored is None or stored[0] != str(revision):
                 return {}
             rows = connection.execute("""
                 SELECT event_key, cleanup_head FROM events
@@ -353,13 +352,18 @@ class EventLedger:
         return {str(key): int(head) for key, head in rows}
 
     def record_cleanup_heads(self, heads: Mapping[str, int], revision: int) -> None:
-        """一个事务记下本轮检查到的 head 与其所在前缀；已离开 dispatched 的事件不再写。"""
+        """一个事务记下本轮检查到的 head；revision 变了先清空旧行，库里的 head 只属于一个 revision。"""
         with self._connect() as connection:
-            connection.execute(
-                "INSERT INTO meta(key, value) VALUES('cleanup_prefix_revision', ?) "
-                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                (str(revision),),
-            )
+            stored = connection.execute(
+                "SELECT value FROM meta WHERE key = 'cleanup_prefix_revision'"
+            ).fetchone()
+            if stored is None or stored[0] != str(revision):
+                connection.execute("UPDATE events SET cleanup_head = NULL WHERE cleanup_head IS NOT NULL")
+                connection.execute(
+                    "INSERT INTO meta(key, value) VALUES('cleanup_prefix_revision', ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    (str(revision),),
+                )
             connection.executemany(
                 "UPDATE events SET cleanup_head = ? WHERE event_key = ? AND status = 'dispatched'",
                 [(head, key) for key, head in heads.items()],

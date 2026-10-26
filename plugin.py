@@ -186,7 +186,7 @@ class Runtime:
         self._bind_lock = asyncio.Lock()
         self._cleanup_lock = asyncio.Lock()
         self._cleanup_heads: dict[str, int] = {}
-        self._cleanup_restored = False
+        self._cleanup_revision: int | None = None
         self._cleanup_unsaved: dict[str, int] = {}
         self._usage: UsageLedger | None = None
 
@@ -308,11 +308,13 @@ class Runtime:
         events = ledger.dispatched_events()
         if heads is None:
             heads = catalog.snapshot_heads()
-        # Failed or unanswered turns stay open and their events stay dispatched; restoring the
-        # checked heads keeps a restart from re-reading every unchanged thread in full.
-        if not self._cleanup_restored:
-            self._cleanup_heads = ledger.cleanup_heads(revision)
-            self._cleanup_restored = True
+        # Checks are only valid for the prefix they were made on: a rewrite (or the first pass)
+        # drops them. Failed or unanswered turns stay open and their events stay dispatched, so
+        # restoring the checks keeps a restart from re-reading every unchanged thread in full.
+        if revision != self._cleanup_revision:
+            self._cleanup_revision = revision
+            self._cleanup_unsaved = {}
+            self._cleanup_heads = {} if revision is None else self._restore_cleanup_heads(ledger, revision)
         live = {event.event_key for event in events}
         self._cleanup_heads = {key: head for key, head in self._cleanup_heads.items() if key in live}
         checked = self._cleanup_unsaved = {
@@ -358,6 +360,15 @@ class Runtime:
                 logger.warning("github-watch cleanup heads not saved; retrying next pass", exc_info=True)
             else:
                 checked.clear()
+
+    @staticmethod
+    def _restore_cleanup_heads(ledger: EventLedger, revision: int) -> dict[str, int]:
+        """A failed read only costs a full re-check; it must not stop the watcher."""
+        try:
+            return ledger.cleanup_heads(revision)
+        except sqlite3.Error:
+            logger.warning("github-watch cleanup heads not restored; re-checking all", exc_info=True)
+            return {}
 
     def _record_usage(
         self, event: EventState, turn: Turn, messages: Iterable[Message],
