@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import re
+import sqlite3
 from collections.abc import AsyncGenerator, Awaitable, Callable, Iterable, Mapping
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
@@ -186,6 +187,7 @@ class Runtime:
         self._cleanup_lock = asyncio.Lock()
         self._cleanup_heads: dict[str, int] = {}
         self._cleanup_restored = False
+        self._cleanup_unsaved: dict[str, int] = {}
         self._usage: UsageLedger | None = None
 
     async def bind(self) -> tuple[EventLedger, CheckoutManager, GitHubOperations, GitHubWatch]:
@@ -301,18 +303,20 @@ class Runtime:
         stats: Callable[[str], ModelCallStats] | None = None,
     ) -> None:
         """Delete completed checkouts before settling their durable event records."""
+        # Read the prefix revision before any snapshot so a concurrent rewrite invalidates what this pass saves.
+        revision = catalog.prefix_revision()
         events = ledger.dispatched_events()
         if heads is None:
             heads = catalog.snapshot_heads()
         # Failed or unanswered turns stay open and their events stay dispatched; restoring the
         # checked heads keeps a restart from re-reading every unchanged thread in full.
         if not self._cleanup_restored:
-            self._cleanup_heads = ledger.cleanup_heads()
+            self._cleanup_heads = ledger.cleanup_heads(revision)
             self._cleanup_restored = True
-        checked: dict[str, int] = {}
-        self._cleanup_heads = {
-            event.event_key: self._cleanup_heads[event.event_key]
-            for event in events if event.event_key in self._cleanup_heads
+        live = {event.event_key for event in events}
+        self._cleanup_heads = {key: head for key, head in self._cleanup_heads.items() if key in live}
+        checked = self._cleanup_unsaved = {
+            key: head for key, head in self._cleanup_unsaved.items() if key in live
         }
         turns: dict[str, tuple[Turn, ...]] = {}
         snapshots: dict[str, tuple[Message, ...]] = {}
@@ -345,9 +349,15 @@ class Runtime:
             # 4. Usage is settled after completion so a stats failure can never hold the event back.
             if stats is not None:
                 self._record_usage(event, turn, snapshots[event.thread_id], stats)
-        # 5. New checks are written back in one transaction; a lost write only costs a re-read on restart.
-        if checked:
-            ledger.record_cleanup_heads(checked)
+        # 5. New checks are written back in one transaction; a failed write is retried next pass
+        #    and at worst costs a re-read on restart, so it must not stop the watcher.
+        if checked and revision is not None:
+            try:
+                ledger.record_cleanup_heads(checked, revision)
+            except sqlite3.Error:
+                logger.warning("github-watch cleanup heads not saved; retrying next pass", exc_info=True)
+            else:
+                checked.clear()
 
     def _record_usage(
         self, event: EventState, turn: Turn, messages: Iterable[Message],

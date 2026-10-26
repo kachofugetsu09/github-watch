@@ -337,18 +337,29 @@ class EventLedger:
             )
         return proposed
 
-    def cleanup_heads(self) -> dict[str, int]:
-        """返回仍在等待终态的事件上次检查到的会话 head；重启后同一 head 不必重读。"""
+    def cleanup_heads(self, revision: int | None) -> dict[str, int]:
+        """返回同一消息前缀下检查过的会话 head；前缀改写过或无法确认时清空，全部重新判断。"""
         with self._connect() as connection:
+            stored = connection.execute(
+                "SELECT value FROM meta WHERE key = 'cleanup_prefix_revision'"
+            ).fetchone()
+            if revision is None or stored is None or stored[0] != str(revision):
+                connection.execute("UPDATE events SET cleanup_head = NULL WHERE cleanup_head IS NOT NULL")
+                return {}
             rows = connection.execute("""
                 SELECT event_key, cleanup_head FROM events
                 WHERE status = 'dispatched' AND cleanup_head IS NOT NULL
                 """).fetchall()
         return {str(key): int(head) for key, head in rows}
 
-    def record_cleanup_heads(self, heads: Mapping[str, int]) -> None:
-        """一个事务记下本轮检查到的 head；已离开 dispatched 的事件不再写。"""
+    def record_cleanup_heads(self, heads: Mapping[str, int], revision: int) -> None:
+        """一个事务记下本轮检查到的 head 与其所在前缀；已离开 dispatched 的事件不再写。"""
         with self._connect() as connection:
+            connection.execute(
+                "INSERT INTO meta(key, value) VALUES('cleanup_prefix_revision', ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (str(revision),),
+            )
             connection.executemany(
                 "UPDATE events SET cleanup_head = ? WHERE event_key = ? AND status = 'dispatched'",
                 [(head, key) for key, head in heads.items()],
