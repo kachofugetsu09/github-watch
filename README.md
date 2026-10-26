@@ -11,6 +11,7 @@ Akashic API v3 插件。它轮询 GitHub，把可处理事件作为 programmatic
 - 这些 Session 都归属 `project_id` 指定的 Akasha 项目（默认是专用项目 `github-watch`），项目同时就是它们的记忆范围。该项目应设为不学习、不召回：`persist_memory=False` 只停写，读由 scope 的 recall 策略决定，没有范围时默认允许读，会把整份记忆注入每一轮上下文。`project_id` 必须是真实存在的项目 ID——`project` 维度由 projects 插件独占注册并校验存在性。
 - SQLite 账本持久化事件、operation、Session 和 Input Message identity。进程若在 Message 提交期间退出，启动后用相同 ID 重试，由 Core 的 append 幂等边界消除重复输入。
 - 每个事件构建一份证据包和 detached operation checkout。Message 投影达到终态后删除该 checkout；异常退出由 TTL sweeper 与 worktree prune 回收。
+- 失败或没有回答的 turn 在投影里一直是 open，事件留在 `dispatched`。每个事件检查过的会话 head 记在 `events.cleanup_head`，重启后 head 没变的会话不再整段重读；head 前进后照常重新判断。
 - Agent 默认只分析。写操作必须由该 programmatic Input 的真实 Tool execution 发起，并携带对应 `operation_id`。只有 owner mention 事件可以 push 或创建 PR。
 - comment、review 和 PR 使用 operation marker 查询去重。push 只允许一个 operation 分支，已记录的同名 push 可重复调用，换名会失败。
 - Issue 修复 PR 应用 `Fixes #<issue>` 关联原 Issue；PR 上的后续修改默认更新原 PR，不能把另开替代 PR 当作失败 fallback。

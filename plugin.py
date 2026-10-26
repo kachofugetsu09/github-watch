@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import re
+import sqlite3
 from collections.abc import AsyncGenerator, Awaitable, Callable, Iterable, Mapping
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
@@ -185,6 +186,8 @@ class Runtime:
         self._bind_lock = asyncio.Lock()
         self._cleanup_lock = asyncio.Lock()
         self._cleanup_heads: dict[str, int] = {}
+        self._cleanup_revision: int | None = None
+        self._cleanup_unsaved: dict[str, int] = {}
         self._usage: UsageLedger | None = None
 
     async def bind(self) -> tuple[EventLedger, CheckoutManager, GitHubOperations, GitHubWatch]:
@@ -300,12 +303,22 @@ class Runtime:
         stats: Callable[[str], ModelCallStats] | None = None,
     ) -> None:
         """Delete completed checkouts before settling their durable event records."""
+        # Read the prefix revision before any snapshot so a concurrent rewrite invalidates what this pass saves.
+        revision = catalog.prefix_revision()
         events = ledger.dispatched_events()
         if heads is None:
             heads = catalog.snapshot_heads()
-        self._cleanup_heads = {
-            event.event_key: self._cleanup_heads[event.event_key]
-            for event in events if event.event_key in self._cleanup_heads
+        # Checks are only valid for the prefix they were made on: a rewrite (or the first pass)
+        # drops them. Failed or unanswered turns stay open and their events stay dispatched, so
+        # restoring the checks keeps a restart from re-reading every unchanged thread in full.
+        if revision != self._cleanup_revision:
+            self._cleanup_revision = revision
+            self._cleanup_unsaved = {}
+            self._cleanup_heads = {} if revision is None else self._restore_cleanup_heads(ledger, revision)
+        live = {event.event_key for event in events}
+        self._cleanup_heads = {key: head for key, head in self._cleanup_heads.items() if key in live}
+        checked = self._cleanup_unsaved = {
+            key: head for key, head in self._cleanup_unsaved.items() if key in live
         }
         turns: dict[str, tuple[Turn, ...]] = {}
         snapshots: dict[str, tuple[Message, ...]] = {}
@@ -328,7 +341,7 @@ class Runtime:
                 if event.input_message_id in turn.message_ids
             ), None)
             if turn is None or turn.status == "open":
-                self._cleanup_heads[event.event_key] = head
+                self._cleanup_heads[event.event_key] = checked[event.event_key] = head
                 continue
             # 3. Failed deletion must remain dispatched so restart can retry it.
             if not checkouts.cleanup(event.operation_id):
@@ -338,6 +351,24 @@ class Runtime:
             # 4. Usage is settled after completion so a stats failure can never hold the event back.
             if stats is not None:
                 self._record_usage(event, turn, snapshots[event.thread_id], stats)
+        # 5. New checks are written back in one transaction; a failed write is retried next pass
+        #    and at worst costs a re-read on restart, so it must not stop the watcher.
+        if checked and revision is not None:
+            try:
+                ledger.record_cleanup_heads(checked, revision)
+            except sqlite3.Error:
+                logger.warning("github-watch cleanup heads not saved; retrying next pass", exc_info=True)
+            else:
+                checked.clear()
+
+    @staticmethod
+    def _restore_cleanup_heads(ledger: EventLedger, revision: int) -> dict[str, int]:
+        """A failed read only costs a full re-check; it must not stop the watcher."""
+        try:
+            return ledger.cleanup_heads(revision)
+        except sqlite3.Error:
+            logger.warning("github-watch cleanup heads not restored; re-checking all", exc_info=True)
+            return {}
 
     def _record_usage(
         self, event: EventState, turn: Turn, messages: Iterable[Message],
