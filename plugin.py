@@ -17,16 +17,53 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 
 from agent.plugin_composition import Context, RUNTIME_STARTED, RUNTIME_STOPPING, ServiceKey
 from agent.plugin_composition.plugin_config import PLUGIN_CONFIG
+from agent.plugin_composition.tasks import RESTART_GATE, TASKS, Task
+from plugins.content.contract import CONTENT
 from plugins.timer.contract import TimerStatus
-from plugins.ledger.contract import MESSAGE_CATALOG, MessageCatalog
+from plugins.ledger.contract import (
+    BINDINGS,
+    MESSAGE_CATALOG,
+    MESSAGE_WRITERS,
+    SESSION_ADMISSION,
+    ContentPart,
+    ContentReferences,
+    Control,
+    Input,
+    Message,
+    MessageCatalog,
+    MessageConflict,
+    MessageReader,
+    OwnerTransaction,
+    SessionAttributes,
+    json_value,
+)
 from plugins.timer.contract import TIMERS
-from plugins.ledger.contract import ContentPart, Input, Message, json_value
 from core.common.file_io import run_file_io
 
-from plugins.programmatic.contract import AdmitParams, PROGRAMMATIC, ProgrammaticService, SendParams
-from plugins.tools.contract import ProviderBoundTool as BoundTool, CallSource, Result, ToolView, TOOLS
+from plugins.reply_program.contract import REPLY_EXECUTE_V4 as REPLY_EXECUTE
+from plugins.sources.contract import (
+    SOURCE_CHECK_V2 as SOURCE_CHECK,
+    SOURCE_SESSION_V4 as SOURCE_SESSION,
+    GuardedSourceSession as SourceSession,
+)
+from plugins.tools.contract import (
+    ALL_TOOLS,
+    TOOLS,
+    CallSource,
+    ProviderBoundTool as BoundTool,
+    Result,
+    ToolRef,
+    ToolView,
+)
 from plugins.models.contract import (
-    CHAT_MODELS, MODEL_CALL_STATS, MODEL_CATALOG, ChatModelSelection, ModelCallStats, ModelChoice, ModelUse,
+    CHAT_MODELS,
+    MODEL_CALL_STATS,
+    MODEL_CATALOG,
+    MODEL_SELECTION,
+    ChatModelSelection,
+    ModelCallStats,
+    ModelChoice,
+    ModelUse,
 )
 from plugins.plugin_settings.contract import SETTINGS_FORMS, SettingsField, SettingsForm, declare_settings
 from plugins.turn_projection.contract import TURN_PROJECTION, Turn, TurnProjection
@@ -142,39 +179,135 @@ SETTINGS_FORM = SettingsForm(
 )
 
 
+SOURCE = "github-watch"
+_BASE_TOOL_GROUPS = frozenset({"files", "content_view", "shell", "working_directory"})
+
+
+def _set_project_archived(workspace: Path, project_id: str, archived: bool) -> bool:
+    """Keep the dedicated github-watch project archived in Web UI, unarchiving only during new session admission."""
+    db_path = workspace / "sessions.db"
+    if not db_path.is_file():
+        return False
+    key = f"project:{project_id}"
+    changed = False
+    with sqlite3.connect(db_path, timeout=30.0) as conn:
+        rows = conn.execute(
+            "SELECT owner, value FROM owner_records WHERE key = ?",
+            (key,),
+        ).fetchall()
+        for owner, raw in rows:
+            try:
+                data = json.loads(raw)
+            except Exception:
+                continue
+            if not isinstance(data, dict) or data.get("archived") is archived:
+                continue
+            data["archived"] = archived
+            conn.execute(
+                "UPDATE owner_records SET value = ? WHERE owner = ? AND key = ?",
+                (json.dumps(data, ensure_ascii=False, sort_keys=True), owner, key),
+            )
+            changed = True
+    return changed
+
+
+def open_source(ctx: Context, session_id: str) -> SourceSession:
+    """Open one internal github-watch Session with automation provenance (author='github-watch')."""
+    reader = ctx.require(MESSAGE_CATALOG).reader(session_id)
+    if reader.attributes.visibility != "internal":
+        raise ValueError("GitHub Watch Session 尚未通过内部来源准入")
+
+    def check_model(part: ContentPart) -> ContentReferences:
+        with ctx.borrow(MODEL_SELECTION) as selection:
+            if selection is None:
+                raise ValueError("当前组合不提供模型选择能力")
+            return selection.check(part)
+
+    writers = ctx.require(MESSAGE_WRITERS)
+    return ctx.require(SOURCE_SESSION)(
+        reader=reader,
+        inputs=writers.bind(
+            ctx,
+            author=SOURCE,
+            source=SOURCE,
+            body_types=(Input,),
+            content={
+                "text": ctx.require(CONTENT).check_text,
+                "model.selection": check_model,
+            },
+        )(session_id),
+        controls=writers.bind(
+            ctx,
+            author=SOURCE,
+            source=SOURCE,
+            body_types=(Control,),
+            content={},
+        )(session_id),
+        tasks=ctx.require(TASKS).open(ctx),
+        restart_gate=ctx.require(RESTART_GATE),
+    )
+
+
 class _ProgrammaticMessages(ProgrammaticMessagePort):
-    """Adapt the ordinary programmatic source without inventing a Turn identity."""
-    def __init__(self, api: ProgrammaticService, model: Callable[[], Awaitable[ChatModelSelection]],
+    """Admit internal sessions and append github-watch automation Inputs directly."""
+    def __init__(self, ctx: Context, model: Callable[[], Awaitable[ChatModelSelection]],
                  scope: str | None = None) -> None:
-        self._api = api
+        self._ctx = ctx
         self._model = model
         self._scope = scope
+        if hasattr(ctx, "entrypoint"):
+            self.admit = ctx.entrypoint(self.admit)  # type: ignore[method-assign]
+            self.submit = ctx.entrypoint(self.submit)  # type: ignore[method-assign]
 
     async def admit(self, session_id: str) -> None:
         # scope 缺省时不传：账本 IO 等不涉及记忆的验证组合没有 projects 插件，
         # 带上 project 维度会因「维度没有 owner」被拒。
-        params = (AdmitParams(session_id=session_id) if self._scope is None
-                  else AdmitParams(session_id=session_id, scope={"project": self._scope}))
-        result = await self._api.call("programmatic/session/admit", params)
-        if result.get("session_id") != session_id:
-            raise RuntimeError("programmatic Session admission identity mismatch")
+        attributes = (
+            SessionAttributes(visibility="internal", learning="excluded")
+            if self._scope is None
+            else SessionAttributes.scoped(
+                {"project": self._scope}, visibility="internal", learning="excluded"
+            )
+        )
+        admission = self._ctx.require(SESSION_ADMISSION)
+        try:
+            accepted = await admission.ensure_async(self._ctx, session_id, attributes)
+        except MessageConflict as exc:
+            if self._scope is None or "项目已归档" not in str(exc):
+                raise
+            workspace = self._ctx.runtime.workspace
+            scope = self._scope
+            unarchived = await run_file_io(lambda: _set_project_archived(workspace, scope, False))
+            if not unarchived:
+                raise
+            try:
+                accepted = await admission.ensure_async(self._ctx, session_id, attributes)
+            finally:
+                await run_file_io(lambda: _set_project_archived(workspace, scope, True))
+        if accepted.visibility != "internal":
+            raise RuntimeError("github-watch Session admission visibility mismatch")
 
     async def model(self) -> str:
         model = await self._model()
         return json.dumps({"model_id": model.model_id, "reasoning_effort": model.reasoning_effort})
 
     async def submit(self, session_id: str, message_id: str, content: str, model: str | None) -> str:
-        # 冻结的选择里两个字段总是显式给出：选回默认时空值也要写进会话，清掉上一次的指定。
-        params = SendParams(session_id=session_id, message_id=message_id, text=content)
+        if not content.strip():
+            raise ValueError("GitHub Watch 输入不能为空白")
+        parts: tuple[ContentPart, ...] = (ContentPart("text", content),)
         if model is not None:
             pinned = json.loads(model)
-            params = SendParams(session_id=session_id, message_id=message_id, text=content,
-                                model_id=pinned["model_id"], reasoning_effort=pinned["reasoning_effort"])
-        result = await self._api.call("programmatic/message/send", params)
-        accepted = result.get("message_id")
-        if accepted != message_id:
-            raise RuntimeError("programmatic Message admission identity mismatch")
-        return cast(str, accepted)
+            with self._ctx.borrow(MODEL_SELECTION) as selection:
+                has_selection = selection is not None
+            if has_selection or pinned.get("model_id") is not None or pinned.get("reasoning_effort") is not None:
+                parts += (ContentPart("model.selection", {
+                    "model_id": pinned["model_id"],
+                    "reasoning_effort": pinned["reasoning_effort"],
+                }),)
+        accepted = await open_source(self._ctx, session_id).accept(message_id, Input(parts))
+        if accepted.message_id != message_id:
+            raise RuntimeError("github-watch Message admission identity mismatch")
+        return accepted.message_id
 
 
 class Runtime:
@@ -182,6 +315,7 @@ class Runtime:
     def __init__(self, ctx: Context, config: GitHubWatchConfig) -> None:
         self._ctx = ctx
         self._config = config
+        self._tool_refs: tuple[ToolRef, ...] = ()
         self._bound: tuple[EventLedger, CheckoutManager, GitHubOperations, GitHubWatch] | None = None
         self._bind_lock = asyncio.Lock()
         self._cleanup_lock = asyncio.Lock()
@@ -190,6 +324,86 @@ class Runtime:
         self._cleanup_unsaved: dict[str, int] = {}
         self._usage: UsageLedger | None = None
 
+    def set_tools(self, refs: Iterable[ToolRef]) -> None:
+        self._tool_refs = tuple(refs)
+
+    def tool_view(self) -> ToolView:
+        """Build the session-fixed ToolView (github-watch + core file/shell/cwd/notify groups)."""
+        catalog = self._ctx.require(TOOLS)
+        notify = bool(
+            getattr(self._config, "notify_channel", None)
+            and getattr(self._config, "notify_chat_id", None)
+        )
+        allowed_groups = _BASE_TOOL_GROUPS | ({"message_push"} if notify else frozenset())
+        by_name: dict[str, ToolRef] = {ref.name: ref for ref in self._tool_refs}
+        for ref in self._ctx.require(ALL_TOOLS)().refs:
+            owner = str(ref.description.get("owner", "")).split("@", 1)[0]
+            if owner in allowed_groups and ref.name not in by_name:
+                by_name[ref.name] = ref
+        return catalog.view(*by_name.values())
+
+    async def _execute_turn(self, task: Task, reader: MessageReader, source: str) -> Message:
+        ctx = self._ctx
+        view = self.tool_view()
+        allowed_names = {ref.name for ref in view.refs}
+        bindings = ctx.require(BINDINGS)
+
+        def check_admission(*, transaction: OwnerTransaction | None = None) -> None:
+            ctx.require(SOURCE_CHECK)(task, reader, source, task.boundary_hint, transaction=transaction)
+
+        async def authorize(
+            binding_id: str, _arguments: Mapping[str, object]
+        ) -> Mapping[str, object] | str:
+            tool = cast(
+                Mapping[str, object], bindings.describe(binding_id, TOOLS)["tool"]
+            )
+            if tool["name"] not in allowed_names:
+                return "当前 GitHub Watch 会话未授予此工具"
+            return {"source": source, "session_id": reader.session_id}
+
+        return await ctx.require(REPLY_EXECUTE)(
+            ctx,
+            task,
+            reader,
+            source,
+            check_admission=check_admission,
+            authorize=authorize,
+            tool_view=view,
+            max_output_tokens=None,
+            max_steps=40,
+            presentation=None,
+            exclude_material_kinds=frozenset({"recall", "profile"}),
+        )
+
+    async def run_dispatched(self) -> None:
+        """Execute any dispatched event whose github-watch Input is still pending reply."""
+        source_session_cls = self._ctx.require(SOURCE_SESSION)
+        if source_session_cls is None:
+            return
+        ledger, _, _, _ = await self.bind()
+        events = await run_file_io(ledger.dispatched_events)
+        catalog = self._ctx.require(MESSAGE_CATALOG)
+        for event in events:
+            session_id = event.thread_id
+            if not session_id:
+                continue
+            try:
+                reader = catalog.reader(session_id)
+                if not await source_session_cls.needs_reply(reader, SOURCE):
+                    continue
+                session = open_source(self._ctx, session_id)
+                task = await session.start(self._execute_turn)
+                if task is not None:
+                    await task.join()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception(
+                    "github-watch turn execution failed event=%s session=%s",
+                    event.event_key,
+                    session_id,
+                )
+
     async def bind(self) -> tuple[EventLedger, CheckoutManager, GitHubOperations, GitHubWatch]:
         """在正式 loop 取得路径，实际状态打开和恢复结束后才发布本代资源。"""
         if self._bound is not None:
@@ -197,11 +411,24 @@ class Runtime:
         async with self._bind_lock:
             if self._bound is None:
                 data_dir = self._ctx.data_root
-                self._bound = await run_file_io(lambda: self._open(data_dir))
+                runtime = getattr(self._ctx, "runtime", None)
+                workspace = getattr(runtime, "workspace", None)
+                project_id = getattr(self._config, "project_id", None)
+                self._bound = await run_file_io(lambda: self._open(data_dir, workspace, project_id))
             return self._bound
 
-    def _open(self, data_dir: Path) -> tuple[EventLedger, CheckoutManager, GitHubOperations, GitHubWatch]:
+    def _open(
+        self,
+        data_dir: Path,
+        workspace: Path | None = None,
+        project_id: str | None = None,
+    ) -> tuple[EventLedger, CheckoutManager, GitHubOperations, GitHubWatch]:
         """在同一物理工作内打开账本并完成原恢复，不访问 Context。"""
+        if isinstance(workspace, Path) and isinstance(project_id, str) and project_id:
+            try:
+                _set_project_archived(workspace, project_id, True)
+            except Exception:
+                logger.warning("github-watch project archive hide skipped", exc_info=True)
         # 1. 原恢复先于任何 poll 或 Tool 使用本代账本。
         data_dir.mkdir(parents=True, exist_ok=True)
         ledger = EventLedger(data_dir / "events.sqlite3")
@@ -243,9 +470,13 @@ class Runtime:
                     _, _, _, watch = await self.bind()
                     await watch.poll(
                         self._config.repositories,
-                        _ProgrammaticMessages(self._ctx.require(PROGRAMMATIC), self.review_model,
-                                              getattr(self._config, "project_id", "p_2a1a417ce3e67ae1ad3bfa26d4b9985a")),
+                        _ProgrammaticMessages(
+                            self._ctx,
+                            self.review_model,
+                            getattr(self._config, "project_id", "p_2a1a417ce3e67ae1ad3bfa26d4b9985a"),
+                        ),
                     )
+                    await self.run_dispatched()
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -335,7 +566,11 @@ class Runtime:
                 except (KeyError, ValueError):
                     continue
                 snapshots[event.thread_id] = messages
-                turns[event.thread_id] = projection.project(messages, "programmatic")
+                source = next(
+                    (msg.source for msg in reversed(messages) if msg.source in {SOURCE, "programmatic"}),
+                    SOURCE,
+                )
+                turns[event.thread_id] = projection.project(messages, source)
             turn = next((
                 turn for turn in turns[event.thread_id]
                 if event.input_message_id in turn.message_ids
@@ -583,9 +818,24 @@ def _definitions() -> tuple[tuple[str, str, Mapping[str, object], str], ...]:
 
 api_version = 3
 name = "github-watch"
-version = "4.2.0"
-desc = "轮询 GitHub，以 programmatic Message 启动工作并提供受约束的 GitHub 工具。"
-inject = (TIMERS, PROGRAMMATIC, MESSAGE_CATALOG, TURN_PROJECTION, TOOLS)
+version = "5.0.0"
+desc = "轮询 GitHub，以独立来源与固定 ToolView 执行评审并提供受约束的 GitHub 工具。"
+inject = (
+    TIMERS,
+    MESSAGE_CATALOG,
+    MESSAGE_WRITERS,
+    SESSION_ADMISSION,
+    BINDINGS,
+    CONTENT,
+    SOURCE_SESSION,
+    SOURCE_CHECK,
+    TASKS,
+    RESTART_GATE,
+    REPLY_EXECUTE,
+    TURN_PROJECTION,
+    TOOLS,
+    ALL_TOOLS,
+)
 
 
 GITHUB_WATCH_TOOLS = ServiceKey[ToolView]("github-watch.tools.v1")
@@ -608,6 +858,7 @@ async def apply(ctx: Context) -> None:
             open=open_tool, idempotent=True,
         ))
 
+    runtime.set_tools(refs)
     await ctx.provide(GITHUB_WATCH_TOOLS, catalog.view(*refs))
     # 设置页是可选依赖：plugin_settings 启用时才出现在「插件配置」里。
     async def settings(child: Context) -> None:

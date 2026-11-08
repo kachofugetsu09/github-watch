@@ -62,11 +62,11 @@ async def scenario(plugin: Any, kind: str, expect_blocking: bool,
         def add_sources(sources: Path) -> None:
             nonlocal source_root
             source_root = sources
-            for name in ("programmatic", "gateway"):
-                shutil.copytree(core / "plugins" / name, sources / name,
-                                ignore=shutil.ignore_patterns("__pycache__"))
 
-        # 1. 真实 Manager 提供 programmatic API；没有 reply loop、模型或 GitHub 请求。
+        async def empty_model() -> Any:
+            return plugin.ChatModelSelection()
+
+        # 1. 真实 Manager 提供账本与来源能力；没有 reply loop、模型或 GitHub 请求。
         async with application(root, replying=False, extra_sources=add_sources) as (log, host):
             path = root / "events.sqlite3"
             ledger = plugin.EventLedger(path)
@@ -90,37 +90,9 @@ async def scenario(plugin: Any, kind: str, expect_blocking: bool,
             ledger.set_thread("owner/repo", "issue", 1, session_id)
             live = host.live_root
             assert live is not None
-            # 本场景只验证账本 IO 与回执恢复，不跑模型、不涉及记忆范围：
-            # 直接实现 port 协议，不走插件的 _ProgrammaticMessages——后者总会把模型选择
-            # 显式写进 Input（含空值，用于清除历史偏好），而本组合不提供 MODEL_SELECTION。
-            # model() 返回空选择 JSON：_dispatch_message 必定读一次选择并冻结（硬路径），
-            # 空选择即跟随默认；submit 不带 model 字段，因此不触发 MODEL_SELECTION 校验。
-            programmatic = live.context.require(plugin.PROGRAMMATIC)
-
-            class _Port:
-                def __init__(self, api) -> None:
-                    self._api = api
-
-                async def admit(self, session_id: str) -> None:
-                    await self._api.call(
-                        "programmatic/session/admit",
-                        plugin.AdmitParams(session_id=session_id),
-                    )
-
-                async def model(self) -> str:
-                    # _dispatch_message 必定读一次选择并冻结进账本（评审模型功能起的硬路径）；
-                    # 返回空选择即跟随默认，submit 不带 model 字段，不触发 MODEL_SELECTION 校验。
-                    return json.dumps({"model_id": None, "reasoning_effort": None})
-
-                async def submit(self, session_id: str, message_id: str, content: str,
-                                 model: str | None) -> str:
-                    result = await self._api.call(
-                        "programmatic/message/send",
-                        plugin.SendParams(session_id=session_id, message_id=message_id, text=content),
-                    )
-                    return str(result.get("message_id"))
-
-            port = _Port(programmatic)
+            conv_gen = host.generation("conversation")
+            assert conv_gen is not None and conv_gen.fiber is not None
+            port = plugin._ProgrammaticMessages(conv_gen.fiber.context, empty_model, None)
             manifest, checkout = root / "manifest.json", root / "checkout"
             manifest.write_text("{}", encoding="utf-8")
             if kind == "recovery_error_cancel":
@@ -338,7 +310,9 @@ async def scenario(plugin: Any, kind: str, expect_blocking: bool,
                 await reopened.load_all()
                 fresh = reopened.live_root
                 assert fresh is not None
-                next_port = _Port(fresh.context.require(plugin.PROGRAMMATIC))
+                fresh_conv = reopened.generation("conversation")
+                assert fresh_conv is not None and fresh_conv.fiber is not None
+                next_port = plugin._ProgrammaticMessages(fresh_conv.fiber.context, empty_model, None)
                 restored = plugin.EventLedger(path)
                 recovery = restored.recover_interrupted()
                 current = restored.get_event(event.event_key)
