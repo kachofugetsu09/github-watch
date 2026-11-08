@@ -19,12 +19,30 @@ from plugins.models.contract import ToolCall as ModelToolCall
 from plugins.tools.contract import TOOL_LOADING_PRESENTATION
 from plugins.tools.contract import TOOL_PROGRAM_V2 as TOOL_PROGRAM
 from plugins.content.plugin import check_text
-from plugins.programmatic.control import AdmitParams, PROGRAMMATIC, SendParams
-from plugins.tools.plugin import TOOLS, ALL_TOOLS
-from plugins.ledger.contract import MESSAGE_CATALOG, CallRef, ContentPart, Output, ToolCall
+from plugins.ledger.contract import (
+    MESSAGE_CATALOG,
+    SESSION_ADMISSION,
+    Actor,
+    CallRef,
+    ContentPart,
+    Output,
+    SessionAttributes,
+    ToolCall,
+    is_user_input,
+    origin,
+)
+from plugins.models.contract import ChatModelSelection
 from tests.test_default_reply import application
 
 from github_watch_test_package.ledger import EventLedger  # pyright: ignore[reportMissingImports]
+from github_watch_test_package.plugin import (  # pyright: ignore[reportMissingImports]
+    GITHUB_WATCH_TOOLS,
+    SOURCE,
+    GitHubWatchConfig,
+    Runtime,
+    _ProgrammaticMessages,
+    _set_project_archived,
+)
 
 
 
@@ -88,8 +106,6 @@ def _local_api():
 
 def _install_sources(sources: Path, plugin_root: Path, api: str, tmp_path: Path) -> None:
     core = Path(os.environ["AKASHIC_AGENT_ROOT"])
-    shutil.copytree(core / "plugins/programmatic", sources / "programmatic")
-    shutil.copytree(core / "plugins/gateway", sources / "gateway")
     shutil.copytree(core / "plugins/timer", sources / "timer")
     shutil.copytree(core / "plugins/tool_search", sources / "tool_search")
     shutil.copytree(
@@ -303,33 +319,205 @@ async def test_real_manager_message_tool_db_uses_local_github_endpoint(
                 await restarted.terminate_all()
 
 
-def test_programmatic_admission_carries_memory_scope() -> None:
-    """评审 Session 必须落在不召回的 scope 里，否则每轮都注入整份记忆。
+def test_native_admission_carries_memory_scope_and_automation_provenance(tmp_path: Path) -> None:
+    """评审 Session 必须直接准入到 internal/excluded + project scope，且写入的消息出处为 automation。"""
+    from types import SimpleNamespace
 
-    `persist_memory=False` 只关写；读由 Akasha 的 scope recall 策略决定，
-    没有 scope 时默认允许读。这里验证适配器确实把 scope 带进了准入参数。
-    """
-    from github_watch_test_package.plugin import _ProgrammaticMessages  # pyright: ignore[reportMissingImports]
+    admitted: list[tuple[str, SessionAttributes]] = []
 
-    class _RecordingProgrammatic:
-        def __init__(self) -> None:
-            self.calls: list[tuple[str, AdmitParams | SendParams]] = []
+    class _FakeAdmission:
+        async def ensure_async(self, _ctx: object, session_id: str, attributes: SessionAttributes) -> SessionAttributes:
+            admitted.append((session_id, attributes))
+            return attributes
 
-        async def call(self, method: str, params: AdmitParams | SendParams, transport=None):  # pyright: ignore[reportMissingParameterType]
-            self.calls.append((method, params))
-            return {"session_id": params.session_id, "message_id": getattr(params, "message_id", None)}
-
-    api = _RecordingProgrammatic()
+    ctx = SimpleNamespace(
+        require=lambda key: _FakeAdmission() if key == SESSION_ADMISSION else None,
+        runtime=SimpleNamespace(workspace=tmp_path),
+    )
 
     async def model():
         raise AssertionError("admit 不应读取模型")
 
-    messages = _ProgrammaticMessages(api, model, "p_2a1a417ce3e67ae1ad3bfa26d4b9985a")
-    asyncio.run(messages.admit("programmatic:github-watch:fixture"))
+    messages = _ProgrammaticMessages(ctx, model, "p_2a1a417ce3e67ae1ad3bfa26d4b9985a")  # type: ignore[arg-type]
+    asyncio.run(messages.admit("github-watch:fixture"))
 
-    assert len(api.calls) == 1
-    method, params = api.calls[0]
-    assert method == "programmatic/session/admit"
-    assert isinstance(params, AdmitParams)
-    assert params.scope == {"project": "p_2a1a417ce3e67ae1ad3bfa26d4b9985a"}
-    assert params.persist_memory is False
+    assert len(admitted) == 1
+    session_id, attributes = admitted[0]
+    assert session_id == "github-watch:fixture"
+    assert attributes.visibility == "internal"
+    assert attributes.learning == "excluded"
+    assert dict(attributes.scope) == {"project": "p_2a1a417ce3e67ae1ad3bfa26d4b9985a"}
+
+
+@pytest.mark.asyncio
+async def test_native_messages_and_fixed_tool_view_direct_schemas(tmp_path: Path) -> None:
+    """不用 programmatic：消息以 author=github-watch 写入，专属 ToolView 直接暴露顶层 schema 且支持归档项目准入。"""
+    plugin_root = Path(__file__).parents[1]
+    with _local_api() as (api, writes):
+        def add_sources(sources: Path) -> None:
+            _install_sources(sources, plugin_root, api, tmp_path)
+
+        async with application(tmp_path, replying=False, shell=True, extra_sources=add_sources) as (log, host):
+            root = host.live_root
+            assert root is not None
+            # 模拟已归档的 github-watch 项目记录：平时对 Web UI 隐藏，准入新会话时自动临时解档再恢复归档。
+            import sqlite3
+            db_path = tmp_path / "workspace/sessions.db"
+            project_id = "p_2a1a417ce3e67ae1ad3bfa26d4b9985a"
+            with sqlite3.connect(db_path) as conn:
+                conn.execute(
+                    "INSERT INTO owner_records(owner, key, version, value) VALUES (?, ?, 0, ?)",
+                    (
+                        "plugin:projects@release",
+                        f"project:{project_id}",
+                        json.dumps({"name": "github-watch", "archived": True}),
+                    ),
+                )
+            from plugins.ledger.contract import MessageConflict
+
+            def check_project(pid: str) -> None:
+                with sqlite3.connect(db_path) as conn:
+                    row = conn.execute(
+                        "SELECT value FROM owner_records WHERE key = ?",
+                        (f"project:{pid}",),
+                    ).fetchone()
+                assert row is not None
+                if json.loads(row[0]).get("archived") is True:
+                    raise MessageConflict(f"项目已归档: {pid}")
+
+            _ = await root.context.require(SESSION_ADMISSION).register_dimension(
+                root.context,
+                name="project",
+                check=check_project,
+            )
+            session_id = "github-watch:fixture"
+            data_root = tmp_path / "workspace/plugin-data/github-watch-builtin"
+            ledger = EventLedger(data_root / "events.sqlite3")
+            ledger.establish_baseline("owner/repo", [])
+            assert ledger.insert_item("owner/repo", "issue", 1, "t1", 0)
+            event = ledger.create_event(
+                event_key="owner/repo:issue:1:opened",
+                repo="owner/repo",
+                kind="issue",
+                number=1,
+                trigger_kind="opened",
+                trigger_id="1",
+            )
+            assert event is not None
+            input_id = "github-watch:" + event.operation_id
+
+            gh_gen = host.generation("github-watch")
+            assert gh_gen is not None and gh_gen.fiber is not None
+            gh_ctx = gh_gen.fiber.context
+            messages = _ProgrammaticMessages(
+                gh_ctx,
+                lambda: asyncio.sleep(0, result=ChatModelSelection()),
+                project_id,
+            )
+            await messages.admit(session_id)
+            with sqlite3.connect(db_path) as conn:
+                archived_after = json.loads(
+                    conn.execute(
+                        "SELECT value FROM owner_records WHERE key = ?",
+                        (f"project:{project_id}",),
+                    ).fetchone()[0]
+                )["archived"]
+            assert archived_after is True
+            for before, after in (
+                ("discovered", "claimed"),
+                ("claimed", "context_ready"),
+                ("context_ready", "message_submitting"),
+            ):
+                ledger.transition(
+                    event.event_key,
+                    expected=(before,),
+                    status=after,
+                    thread_id=session_id,
+                    input_message_id=input_id,
+                )
+            accepted = await messages.submit(session_id, input_id, "review issue", None)
+            assert accepted == input_id
+            ledger.transition(
+                event.event_key,
+                expected=("message_submitting",),
+                status="dispatched",
+                input_message_id=input_id,
+            )
+            ledger.set_thread("owner/repo", "issue", 1, session_id)
+
+            snapshot = log.reader(session_id).snapshot()
+            assert len(snapshot) == 1
+            msg = snapshot[0]
+            assert msg.author == SOURCE
+            assert msg.source == SOURCE
+            assert origin(msg).actor is Actor.AUTOMATION
+            assert not is_user_input(msg)
+
+            # 验证固定 ToolView + NativePresentation：github_watch_* 直接在顶层 schema 中，无需 load_tools / tool_call。
+            gh_view = root.context.require(GITHUB_WATCH_TOOLS)
+            runtime = Runtime(
+                gh_ctx,
+                GitHubWatchConfig(
+                    app_id=1,
+                    installation_id=2,
+                    pem_path=str(tmp_path / "github-app.pem"),
+                    repositories=["owner/repo"],
+                    project_id=project_id,
+                ),
+            )
+            runtime.set_tools(gh_view.refs)
+            fixed_view = runtime.tool_view()
+            schema_names = {ref.name for ref in fixed_view.refs}
+            assert "github_watch_post_comment" in schema_names
+            assert "read_file" in schema_names
+            assert "shell" in schema_names
+            assert "load_tools" not in schema_names
+
+            tools_owner = host.generation("tools")
+            assert tools_owner is not None and tools_owner.fiber is not None
+            async with tools_owner.fiber.context.runtime_scope():
+                menu = await root.context.require(TOOL_PROGRAM).create_menu(
+                    log.reader(session_id),
+                    SOURCE,
+                    content={"text": check_text},
+                    check_start=lambda _transaction: None,
+                    authorize=lambda _binding, _args: asyncio.sleep(0, result={"allowed": True}),
+                    view=fixed_view,
+                    presentation=None,
+                )
+                top_names = {schema["function"]["name"] for schema in menu.schemas}
+                assert "github_watch_post_comment" in top_names
+                assert "tool_call" not in top_names
+                decoded = menu.decode(
+                    ModelToolCall(
+                        "github-direct-call",
+                        "github_watch_post_comment",
+                        {"operation_id": event.operation_id, "body": "native direct review"},
+                    )
+                )
+                assert decoded.binding_id is not None
+                call_writer = log.writer(
+                    session_id,
+                    author="assistant",
+                    source=SOURCE,
+                    body_types=(Output,),
+                    content={},
+                    check_call=menu.check_call,
+                )
+                call_writer.append(
+                    "github-direct-call",
+                    Output(
+                        (
+                            ToolCall(
+                                decoded.binding_id,
+                                {"operation_id": event.operation_id, "body": "native direct review"},
+                            ),
+                        ),
+                        "continue",
+                    ),
+                )
+                result = await menu.execute(CallRef("github-direct-call", 0))
+                assert result.outcome == "success"
+                comments = [row for row in writes if row[1].endswith("/issues/1/comments")]
+                assert len(comments) == 1
+                assert "native direct review" in cast(str, comments[0][2]["body"])

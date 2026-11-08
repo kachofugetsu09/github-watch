@@ -23,10 +23,9 @@ from .operations import GitHubOperations
 
 logger = logging.getLogger("plugin.github-watch")
 
-# Inlined tool signatures. The group is not always-on, so without this the agent
-# spends one turn on load_tools before it can publish anything.
+# Native tool signatures for the fixed session ToolView.
 TOOL_SIGNATURES = """
-工具签名（已内联，无需 load_tools 即可调用；参数用 tool_call 的 arguments 传）：
+本会话已直接挂载专属工具组（files、content_view、shell、working_directory 与 github_watch_*），无需 load_tools 或 tool_call，直接按顶层工具名调用：
 - github_watch_runtime_info {} —— 版本与 checkout 恢复策略。
 - github_watch_post_comment {operation_id: 32 位 hex, body: 非空字符串}
 - github_watch_submit_review {operation_id: 32 位 hex, body: 非空字符串}
@@ -38,7 +37,7 @@ operation_id 一律填上面「操作标识」那一行的值，不要自己编�
 
 def _session_id(event: EventState) -> str:
     identity = f"{event.repo}:{event.kind}:{event.number}".encode()
-    return "programmatic:github-watch:" + hashlib.sha256(identity).hexdigest()[:32]
+    return "github-watch:" + hashlib.sha256(identity).hexdigest()[:32]
 
 
 def _input_message_id(event: EventState) -> str:
@@ -348,7 +347,7 @@ class GitHubWatch:
         item = await run_file_io(lambda: self._ledger.get_item(event.repo, event.kind, event.number))
         if item is None:
             raise RuntimeError(f"event item missing: {event.event_key}")
-        session_id = _session_id(event)
+        session_id = item.thread_id or _session_id(event)
         await messages.admit(session_id)
         if item.thread_id != session_id:
             await run_file_io(lambda: self._ledger.set_thread(event.repo, event.kind, event.number, session_id))

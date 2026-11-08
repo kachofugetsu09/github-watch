@@ -1,14 +1,15 @@
 # github-watch
 
-Akashic API v3 插件。它轮询 GitHub，把可处理事件作为 programmatic Input Message 送入 Akashic，并提供受 operation 约束的 GitHub Tool。
+Akashic API v3 插件。它轮询 GitHub，以独立自动来源（`author="github-watch"`, `source="github-watch"`）将可处理事件写入内部专用 Session，并以会话固定的 `ToolView`（`NativePresentation` 直出顶层 schema）执行代码评审与受 operation 约束的 GitHub Tool。
 
 ## 行为
 
 - 首次启用只为 open Issue/PR 建立静默基线。
 - 基线后新建的 open Issue/PR、draft PR 转为 ready，以及仓库 owner 新发且包含配置 mention 的 comment 会产生稳定事件；commit、编辑、普通 comment、关闭和合并不会唤醒。
 - 「open 才处理」是整条链路的硬条件，不只在列表请求里成立：发现阶段读到非 open 对象只推进游标，不产生事件；派发前按当前状态复查，排队期间被合并或关闭的事件以 `skipped` 终态结束，不做 checkout、不提交 Message；review 和 comment 发布前再复查一次，对象已不是 open 时返回 `skipped` 与原因（`merged` / `closed` / `deleted`），不写入。状态读取失败时放行，避免丢掉真实结论。
-- 同一 Issue/PR 复用一个确定性 programmatic Session；每个事件使用由 `operation_id` 推导的确定性 Input Message ID。提交返回即结束轮询，不等待模型输出。
-- 这些 Session 都归属 `project_id` 指定的 Akasha 项目（默认是专用项目 `github-watch`），项目同时就是它们的记忆范围。该项目应设为不学习、不召回：`persist_memory=False` 只停写，读由 scope 的 recall 策略决定，没有范围时默认允许读，会把整份记忆注入每一轮上下文。`project_id` 必须是真实存在的项目 ID——`project` 维度由 projects 插件独占注册并校验存在性。
+- 同一 Issue/PR 复用一个确定性内部 Session（`github-watch:<sha256>`，存量对象沿用已有 `thread_id`）；每个事件使用由 `operation_id` 推导的确定性 Input Message ID。
+- 这些 Session 都归属 `project_id` 指定的 Akasha 项目（默认是专用项目 `github-watch`），同时在数据库保持 `archived=true` 以不在 Web 侧栏展示该项目；新 Session 准入时自动完成归属校验并恢复归档状态，执行时显式排除 `recall` 与 `profile` 上下文材料。
+- 评审回合使用固定的会话级 `ToolView`（`github-watch` 自有 6 个工具 + `files`、`content_view`、`shell`、`working_directory` 及可选 `message_push`），并以 `NativePresentation` 直接作为顶层工具 schema 暴露给模型，无需 `load_tools` 或 `tool_call` 间接调用，同时物理隔离其他无关外置插件。
 - SQLite 账本持久化事件、operation、Session 和 Input Message identity。进程若在 Message 提交期间退出，启动后用相同 ID 重试，由 Core 的 append 幂等边界消除重复输入。
 - 每个事件构建一份证据包和 detached operation checkout。Message 投影达到终态后删除该 checkout；异常退出由 TTL sweeper 与 worktree prune 回收。
 - 失败或没有回答的 turn 在投影里一直是 open，事件留在 `dispatched`。每个事件检查过的会话 head 记在 `events.cleanup_head`，重启后 head 没变的会话不再整段重读；head 前进后照常重新判断。
