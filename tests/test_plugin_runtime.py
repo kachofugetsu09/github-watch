@@ -521,3 +521,10 @@ async def test_native_messages_and_fixed_tool_view_direct_schemas(tmp_path: Path
                 comments = [row for row in writes if row[1].endswith("/issues/1/comments")]
                 assert len(comments) == 1
                 assert "native direct review" in cast(str, comments[0][2]["body"])
+
+            # 验证完整 run_dispatched -> _execute_turn -> REPLY_EXECUTE 链路（含 OWNER_STATE 权限）
+            runtime._bound = (ledger, None, None, None)  # type: ignore[assignment]
+            async with gh_ctx.runtime_scope():
+                await runtime.run_dispatched()
+            after_run = log.reader(session_id).snapshot()
+            assert any(isinstance(m.body, Output) and m.body.finish == "complete" for m in after_run)
