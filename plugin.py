@@ -851,7 +851,7 @@ async def apply(ctx: Context) -> None:
     config = GitHubWatchConfig.model_validate(ctx.config)
     runtime = Runtime(ctx, config)
     catalog = ctx.require(TOOLS)
-    await catalog.declare_group(ctx, always_on=False, description=desc)
+    await catalog.declare_group(ctx, always_on=False, description=desc, icon="git-pull-request")
     refs = []
     for tool_name, description, parameters, action in _definitions():
         @asynccontextmanager
