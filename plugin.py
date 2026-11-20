@@ -99,6 +99,8 @@ class GitHubWatchConfig(BaseModel):
     bot_login: str = "akashic-review-bot[bot]"
     poll_seconds: int = Field(default=120, ge=15)
     checkout_ttl_seconds: int = Field(default=86_400, ge=300)
+    # 0 = 不限制总步数，与 reply/scheduler/subagent 一致；>0 时在 ReAct 触发步数上限。
+    max_steps: int = Field(default=0, ge=0)
     notify_channel: str | None = None
     notify_chat_id: str | None = None
     # 评审会话归属的 Akasha 项目，也是它们的记忆范围。
@@ -176,6 +178,7 @@ SETTINGS_FORM = SettingsForm(
                       hint="回复提及、审 PR 时用；没指定就跟随默认模型"),
         SettingsField("repositories", "关注的仓库", kind="lines", hint="owner/repo，每行一个"),
         SettingsField("poll_seconds", "轮询间隔（秒）", kind="number", hint="最少 15"),
+        SettingsField("max_steps", "单轮最大步数", kind="number", hint="0 表示不限制（默认 0）"),
     ),
 )
 
@@ -371,7 +374,7 @@ class Runtime:
             authorize=authorize,
             tool_view=view,
             max_output_tokens=None,
-            max_steps=40,
+            max_steps=self._config.max_steps,
             presentation=None,
             exclude_material_kinds=frozenset({"recall", "profile"}),
         )

@@ -528,3 +528,56 @@ async def test_native_messages_and_fixed_tool_view_direct_schemas(tmp_path: Path
                 await runtime.run_dispatched()
             after_run = log.reader(session_id).snapshot()
             assert any(isinstance(m.body, Output) and m.body.finish == "complete" for m in after_run)
+
+
+@pytest.mark.asyncio
+async def test_execute_turn_uses_configured_max_steps(tmp_path: Path) -> None:
+    """max_steps 默认为 0（不限制），且显式配置时按配置值透传给 REPLY_EXECUTE。"""
+    from unittest.mock import MagicMock
+    from pydantic import ValidationError
+    from plugins.reply_program.contract import REPLY_EXECUTE_V4 as REPLY_EXECUTE
+    from plugins.tools.contract import ALL_TOOLS, TOOLS
+    from plugins.ledger.contract import BINDINGS
+    from plugins.sources.contract import SOURCE_CHECK_V2 as SOURCE_CHECK
+    from github_watch_test_package.plugin import SETTINGS_FORM  # pyright: ignore[reportMissingImports]
+
+    assert any(field.name == "max_steps" for field in SETTINGS_FORM.fields)
+
+    base = {
+        "app_id": 1,
+        "installation_id": 2,
+        "pem_path": str(tmp_path / "github-app.pem"),
+        "repositories": ["owner/repo"],
+    }
+    default_cfg = GitHubWatchConfig(**base)
+    assert default_cfg.max_steps == 0
+    assert GitHubWatchConfig(**base, max_steps=120).max_steps == 120
+    with pytest.raises(ValidationError):
+        GitHubWatchConfig(**base, max_steps=-1)
+
+    seen_max_steps: list[int] = []
+
+    async def fake_reply_execute(_ctx, _task, _reader, _source, **kwargs):
+        seen_max_steps.append(kwargs["max_steps"])
+        return MagicMock()
+
+    fake_catalog = MagicMock()
+    fake_catalog.view.return_value = MagicMock(refs=())
+    fake_all_tools = MagicMock(return_value=MagicMock(refs=()))
+    services = {
+        TOOLS: fake_catalog,
+        ALL_TOOLS: fake_all_tools,
+        BINDINGS: MagicMock(),
+        SOURCE_CHECK: MagicMock(),
+        REPLY_EXECUTE: fake_reply_execute,
+    }
+    fake_ctx = MagicMock()
+    fake_ctx.require.side_effect = lambda key: services[key]
+    fake_task = MagicMock()
+    fake_reader = MagicMock(session_id="github-watch:test")
+
+    for cfg in (default_cfg, GitHubWatchConfig(**base, max_steps=120)):
+        rt = Runtime(fake_ctx, cfg)
+        await rt._execute_turn(fake_task, fake_reader, SOURCE)
+
+    assert seen_max_steps == [0, 120]
