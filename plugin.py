@@ -18,6 +18,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 from agent.plugin_composition import Context, RUNTIME_STARTED, RUNTIME_STOPPING, ServiceKey
 from agent.plugin_composition.plugin_config import PLUGIN_CONFIG
 from agent.plugin_composition.tasks import RESTART_GATE, TASKS, Task
+from agent.restart import RestartPendingError
 from plugins.content.contract import CONTENT
 from plugins.timer.contract import TimerStatus
 from plugins.ledger.contract import (
@@ -36,6 +37,7 @@ from plugins.ledger.contract import (
     MessageReader,
     OwnerTransaction,
     SessionAttributes,
+    SourceHeadConflict,
     json_value,
 )
 from plugins.timer.contract import TIMERS
@@ -101,6 +103,8 @@ class GitHubWatchConfig(BaseModel):
     checkout_ttl_seconds: int = Field(default=86_400, ge=300)
     # 0 = 不限制总步数，与 reply/scheduler/subagent 一致；>0 时在 ReAct 触发步数上限。
     max_steps: int = Field(default=0, ge=0)
+    failure_retry_limit: int = Field(default=1, ge=0)
+    failure_retry_delay_seconds: int = Field(default=60, ge=0)
     notify_channel: str | None = None
     notify_chat_id: str | None = None
     # 评审会话归属的 Akasha 项目，也是它们的记忆范围。
@@ -213,6 +217,55 @@ def _set_project_archived(workspace: Path, project_id: str, archived: bool) -> b
             )
             changed = True
     return changed
+
+
+def _pending_failure(
+    reader: MessageReader, input_message_id: str | None,
+) -> tuple[Message, int] | None:
+    """若该 dispatched 输入因 Control('failure') 停住且尚未闭合，返回 (控制消息, source_head)。"""
+    if not input_message_id:
+        return None
+    target = reader.get(input_message_id)
+    if target is None or target.source != SOURCE or not isinstance(target.body, Input):
+        return None
+    head = reader.head(source=SOURCE)
+    if reader.latest_input_seq(SOURCE, through_seq=head) != target.seq:
+        return None
+    if reader.latest_finished_output_seq(SOURCE, after_seq=target.seq, through_seq=head) is not None:
+        return None
+    control = reader.latest_control(SOURCE, through_seq=head)
+    if control is None or not isinstance(control.body, Control):
+        return None
+    if control.body.action != "failure" or control.body.through_seq < target.seq:
+        return None
+    return control, head
+
+
+def _open_turn_failure(messages: Iterable[Message], source: str, turn: Turn) -> str | None:
+    """若未闭合 turn 在其最新控制消息处停在 Control('failure')，返回原因。"""
+    latest_input_seq = -1
+    latest_control: Message | None = None
+    for message in messages:
+        if message.source != source or message.seq <= turn.after_seq or message.seq > turn.through_seq:
+            continue
+        if isinstance(message.body, Input):
+            latest_input_seq = max(latest_input_seq, message.seq)
+        elif isinstance(message.body, Control):
+            latest_control = message
+    if latest_control is None or not isinstance(latest_control.body, Control):
+        return None
+    if latest_control.body.action != "failure" or latest_control.body.through_seq < latest_input_seq:
+        return None
+    return latest_control.body.reason or "legacy programmatic turn failed"
+
+
+def _failure_reason(messages: Iterable[Message], source: str, turn: Turn) -> str | None:
+    for message in reversed(tuple(messages)):
+        if message.source != source or message.seq <= turn.after_seq or message.seq > turn.through_seq:
+            continue
+        if isinstance(message.body, Control) and message.body.action == "failure":
+            return message.body.reason or "github-watch turn failed"
+    return None
 
 
 def open_source(ctx: Context, session_id: str) -> SourceSession:
@@ -379,6 +432,72 @@ class Runtime:
             exclude_material_kinds=frozenset({"recall", "profile"}),
         )
 
+    async def _reconcile_failed(
+        self, ledger: EventLedger, event: EventState, reader: MessageReader,
+    ) -> None:
+        pending = await reader.read_async(
+            lambda current: _pending_failure(current, event.input_message_id)
+        )
+        if pending is None or event.thread_id is None or event.input_message_id is None:
+            return
+        control, head = pending
+        body = cast(Control, control.body)
+        retry_limit = getattr(self._config, "failure_retry_limit", 1)
+        retry_delay = getattr(self._config, "failure_retry_delay_seconds", 60)
+        recorded_at = (
+            control.recorded_at
+            if control.recorded_at.tzinfo is not None
+            else control.recorded_at.replace(tzinfo=UTC)
+        )
+        cooldown_ready = (datetime.now(UTC) - recorded_at).total_seconds() >= retry_delay
+        decision = await run_file_io(
+            lambda: ledger.claim_failure_retry(
+                event.event_key,
+                control_seq=control.seq,
+                max_retries=retry_limit,
+                cooldown_ready=cooldown_ready,
+            )
+        )
+        if decision == "wait":
+            return
+        session = open_source(self._ctx, event.thread_id)
+        if decision == "retry":
+            permit = None
+            with self._ctx.borrow(RESTART_GATE) as restart_gate:
+                if restart_gate is not None:
+                    try:
+                        permit = restart_gate.acquire()
+                    except RestartPendingError:
+                        return
+            try:
+                _ = await session.control(
+                    f"github-watch-resume:{event.operation_id}:{control.seq}",
+                    Control("resume", head),
+                    expected_head=head,
+                    handle=None,
+                )
+            except (MessageConflict, SourceHeadConflict):
+                logger.debug(
+                    "github-watch failure resume skipped due to conflict event=%s",
+                    event.event_key,
+                )
+            finally:
+                if permit is not None:
+                    permit.release()
+            return
+        try:
+            _ = await session.control(
+                f"github-watch-abandon:{event.operation_id}:{control.seq}",
+                Control("abandon", head, body.reason or "github-watch turn failed"),
+                expected_head=head,
+                handle=None,
+            )
+        except (MessageConflict, SourceHeadConflict):
+            logger.debug(
+                "github-watch failure abandon skipped due to conflict event=%s",
+                event.event_key,
+            )
+
     async def run_dispatched(self) -> None:
         """Execute any dispatched event whose github-watch Input is still pending reply."""
         source_session_cls = self._ctx.require(SOURCE_SESSION)
@@ -386,13 +505,13 @@ class Runtime:
             return
         ledger, _, _, _ = await self.bind()
         events = await run_file_io(ledger.dispatched_events)
-        catalog = self._ctx.require(MESSAGE_CATALOG)
         for event in events:
             session_id = event.thread_id
             if not session_id:
                 continue
             try:
-                reader = catalog.reader(session_id)
+                reader = self._ctx.require(MESSAGE_CATALOG).reader(session_id)
+                await self._reconcile_failed(ledger, event, reader)
                 if not await source_session_cls.needs_reply(reader, SOURCE):
                     continue
                 session = open_source(self._ctx, session_id)
@@ -555,37 +674,71 @@ class Runtime:
         checked = self._cleanup_unsaved = {
             key: head for key, head in self._cleanup_unsaved.items() if key in live
         }
-        turns: dict[str, tuple[Turn, ...]] = {}
+        turns: dict[tuple[str, str], tuple[Turn, ...]] = {}
         snapshots: dict[str, tuple[Message, ...]] = {}
-        # 2. Unrelated sessions do not trigger reads; each changed session is projected once.
+        # 2. Unrelated sessions do not trigger reads; each changed (session, source) is projected once.
         for event in events:
             if event.thread_id is None or event.input_message_id is None:
                 continue
             head = heads.get(event.thread_id)
             if head is None or self._cleanup_heads.get(event.event_key) == head:
                 continue
-            if event.thread_id not in turns:
+            if event.thread_id not in snapshots:
                 try:
-                    messages = catalog.reader(event.thread_id).snapshot(through_seq=head)
+                    snapshots[event.thread_id] = catalog.reader(event.thread_id).snapshot(through_seq=head)
                 except (KeyError, ValueError):
                     continue
-                snapshots[event.thread_id] = messages
+            messages = snapshots[event.thread_id]
+            source = next(
+                (msg.source for msg in messages if msg.message_id == event.input_message_id),
+                None,
+            )
+            if source is None:
                 source = next(
                     (msg.source for msg in reversed(messages) if msg.source in {SOURCE, "programmatic"}),
                     SOURCE,
                 )
-                turns[event.thread_id] = projection.project(messages, source)
+            key = (event.thread_id, source)
+            if key not in turns:
+                turns[key] = projection.project(messages, source)
             turn = next((
-                turn for turn in turns[event.thread_id]
+                turn for turn in turns[key]
                 if event.input_message_id in turn.message_ids
             ), None)
-            if turn is None or turn.status == "open":
+            if turn is None:
+                self._cleanup_heads[event.event_key] = checked[event.event_key] = head
+                continue
+            if turn.status == "open":
+                if source == "programmatic":
+                    legacy_reason = _open_turn_failure(messages, source, turn)
+                    if legacy_reason is not None:
+                        # 旧通知的 head 可能滞后于实际日志；仅在来源头仍在当前失效位置时才迁出 dispatched。
+                        if catalog.reader(event.thread_id).head(source=source) != turn.through_seq:
+                            continue
+                        # 旧来源仍可能由人工或原调用方恢复，保留 checkout 交由 TTL 回收，只迁出 dispatched。
+                        ledger.transition(
+                            event.event_key,
+                            expected=("dispatched",),
+                            status="manual_reconcile",
+                            error=legacy_reason,
+                        )
+                        self._cleanup_heads.pop(event.event_key, None)
+                        continue
                 self._cleanup_heads[event.event_key] = checked[event.event_key] = head
                 continue
             # 3. Failed deletion must remain dispatched so restart can retry it.
             if not checkouts.cleanup(event.operation_id):
                 logger.debug("github-watch checkout already absent event=%s", event.event_key)
-            ledger.transition(event.event_key, expected=("dispatched",), status="completed")
+            if turn.status == "abandoned":
+                reason = _failure_reason(messages, source, turn)
+                ledger.transition(
+                    event.event_key,
+                    expected=("dispatched",),
+                    status="failed",
+                    error=reason or "github-watch turn abandoned",
+                )
+            else:
+                ledger.transition(event.event_key, expected=("dispatched",), status="completed")
             self._cleanup_heads.pop(event.event_key, None)
             # 4. Usage is settled after completion so a stats failure can never hold the event back.
             if stats is not None:

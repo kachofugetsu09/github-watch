@@ -9,6 +9,7 @@ from contextlib import closing, contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Literal
 
 
 def utc_now() -> str:
@@ -369,6 +370,48 @@ class EventLedger:
                 [(head, key) for key, head in heads.items()],
             )
 
+    def claim_failure_retry(
+        self,
+        event_key: str,
+        *,
+        control_seq: int,
+        max_retries: int,
+        cooldown_ready: bool,
+    ) -> Literal["retry", "wait", "abandon"]:
+        """决定遇 Control('failure') 停住的 dispatched 事件是重试、等冷却还是放弃结算。"""
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT status, failure_retries, last_failure_seq
+                FROM events WHERE event_key = ?
+                """,
+                (event_key,),
+            ).fetchone()
+            if row is None or row[0] != "dispatched":
+                return "wait"
+            if max_retries <= 0:
+                return "abandon"
+            retries = int(row[1] or 0)
+            last_seq = row[2]
+            if last_seq == control_seq:
+                return "retry"
+            if retries >= max_retries:
+                return "abandon"
+            if not cooldown_ready:
+                return "wait"
+            connection.execute(
+                """
+                UPDATE events
+                SET failure_retries = failure_retries + 1,
+                    last_failure_seq = ?,
+                    updated_at = ?
+                WHERE event_key = ? AND status = 'dispatched'
+                """,
+                (control_seq, utc_now(), event_key),
+            )
+            return "retry"
+
     def transition(
         self,
         event_key: str,
@@ -453,6 +496,7 @@ class EventLedger:
                         REFERENCES items(repo, kind, number)
                 );
                 """)
+            connection.execute("BEGIN IMMEDIATE")
             self._migrate(connection)
 
     def _migrate(self, connection: sqlite3.Connection) -> None:
@@ -470,6 +514,12 @@ class EventLedger:
             connection.execute("ALTER TABLE events ADD COLUMN model_pin TEXT")
         if "cleanup_head" not in event_columns:
             connection.execute("ALTER TABLE events ADD COLUMN cleanup_head INTEGER")
+        if "failure_retries" not in event_columns:
+            connection.execute("ALTER TABLE events ADD COLUMN failure_retries INTEGER NOT NULL DEFAULT 0")
+            # 升级起按 (session, source) 投影，旧水位可能由另一来源遮蔽遗留事件，迁移时清空重算一次。
+            connection.execute("UPDATE events SET cleanup_head = NULL WHERE cleanup_head IS NOT NULL")
+        if "last_failure_seq" not in event_columns:
+            connection.execute("ALTER TABLE events ADD COLUMN last_failure_seq INTEGER")
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
