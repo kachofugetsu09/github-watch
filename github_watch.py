@@ -435,6 +435,7 @@ class GitHubWatch:
 
 你处在这个 Issue/PR 的稳定专用 Session 中，上一次评论和完整历史都在该 Session 与本次证据包中。
 先读 manifest 和 files.json 改动清单，按需打开 patches/ 下的补丁，再只在临时仓库中读取、测试或修改，以新鲜 GitHub 证据为准。
+临时仓库是纯净 detached checkout，默认不含 node_modules 或项目虚拟环境；运行 npm/npx/前端检查脚本前先确认依赖已存在，不要盲目直接执行。
 files.json 只是改动清单（文件名、状态、增删行数、has_patch），每个文件的 diff 单独放在
 patches/ 目录，文件名带序号前缀；manifest 的 patches 字段列出了每个补丁的路径与摘要。
 补丁缺失（has_patch 为 false）表示 GitHub 未提供该文件 diff（大文件或二进制），
